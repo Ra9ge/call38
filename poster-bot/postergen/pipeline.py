@@ -108,7 +108,8 @@ def residual_text(clean: np.ndarray, mask: np.ndarray, logo_mask: np.ndarray | N
     if logo_mask is not None and reach > 0 and logo_mask.any():
         around = cv2.distanceTransform((logo_mask == 0).astype(np.uint8), cv2.DIST_L2, 3) <= reach
         regions.append(around)
-    regions.append(mask > 0)
+    if around is None or (mask[~around] > 0).any():      # другой стёртый текст вне зоны логотипа
+        regions.append((mask > 0) & ~around if around is not None else mask > 0)
     out, seen = [], []
     for reg in regions:
         ys, xs = np.nonzero(reg)
