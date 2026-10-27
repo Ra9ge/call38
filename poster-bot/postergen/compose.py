@@ -65,6 +65,9 @@ def _row_segments(row: Row, styles: dict) -> list[Seg]:
 
 def choose_font(styles: list[BoxStyle], forced: str | None = None) -> FontChoice:
     if forced:
+        from .block import FONT_CLASSES
+        if forced in FONT_CLASSES:
+            return FONT_CLASSES[forced]
         return {"comfortaa": CUTE, "rubik": BOLD, "montserrat": CLEAN, "tinos": SERIF}.get(
             forced, FontChoice(forced, 800))
     kinds = {s.kind for s in styles}
@@ -603,8 +606,9 @@ def _balanced_lines(words: list[str], n: int) -> list[list[str]]:
         lines = [words[b[i]:b[i + 1]] for i in range(n)]
         lens = [sum(len(w) for w in ln) + len(ln) - 1 for ln in lines]
         cost = max(lens) - min(lens) * 0.3
-        # предлог в конце строки — плохо
+        # предлог в конце строки — плохо; разрыв после «:», «,», «—» — хорошо
         cost += sum(6 for ln in lines[:-1] if ln[-1].lower().strip(",.:") in SHORT_WORDS)
+        cost -= sum(0.35 * max(lens) for ln in lines[:-1] if ln[-1].endswith((":", ",", ";", "—", "–", ".", "!", "?")))
         if cost < best_cost:
             best, best_cost = lines, cost
     return best

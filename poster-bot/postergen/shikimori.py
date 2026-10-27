@@ -18,12 +18,21 @@ from PIL import Image
 DEFAULT_DOMAINS = ("https://shikimori.io", "https://shikimori.one", "https://shiki.one", "https://shikimori.me")
 USER_AGENT = os.environ.get("SHIKIMORI_USER_AGENT", "PosterBot/1.0")
 
-FIELDS = """
+FIELDS_BASE = """
     id name russian english japanese synonyms kind status episodes url
     airedOn { year }
     poster { originalUrl mainUrl }
 """
-GRAPHQL_QUERY = "query($ids: String!) { animes(ids: $ids, limit: 1) {" + FIELDS + "} }"
+FIELDS_EXTRA = "    genres { name russian kind }\n"     # жанры — для выбора шрифта
+FIELDS = FIELDS_BASE + FIELDS_EXTRA
+_extra_ok = True        # если сервер не знает поле genres — дальше спрашиваем без него
+
+
+def _one_query(fields: str) -> str:
+    return "query($ids: String!) { animes(ids: $ids, limit: 1) {" + fields + "} }"
+
+
+GRAPHQL_QUERY = _one_query(FIELDS)
 
 ORDERS = ("popularity", "ranked", "aired_on", "id", "name")
 _SAFE_ARG = re.compile(r"^[a-z0-9_,!\-]+$")
@@ -49,6 +58,7 @@ class AnimeInfo:
     year: int | None = None
     poster_url: str | None = None
     url: str | None = None
+    genres: list[str] = field(default_factory=list)   # английские названия жанров: Action, Romance…
 
     @property
     def has_poster(self) -> bool:
@@ -198,7 +208,17 @@ def _info_from_gql(a: dict, domain: str) -> AnimeInfo:
         year=(a.get("airedOn") or {}).get("year"),
         poster_url=_abs(poster.get("originalUrl") or poster.get("mainUrl"), domain),
         url=_abs(a.get("url"), domain),
+        genres=_genres(a.get("genres")),
     )
+
+
+def _genres(items) -> list[str]:
+    out = []
+    for g in items or []:
+        name = g.get("name") if isinstance(g, dict) else str(g)
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 def _info_from_rest(a: dict, domain: str) -> AnimeInfo:
@@ -215,6 +235,7 @@ def _info_from_rest(a: dict, domain: str) -> AnimeInfo:
         year=int(aired[:4]) if aired[:4].isdigit() else None,
         poster_url=_abs(image.get("original"), domain),
         url=_abs(a.get("url"), domain),
+        genres=_genres(a.get("genres")),
     )
 
 
@@ -232,6 +253,20 @@ def _json(r: requests.Response, what: str):
 
 
 def _gql(domain: str, query: str, session: requests.Session, variables: dict | None = None) -> list:
+    global _extra_ok
+    if not _extra_ok:
+        query = query.replace(FIELDS_EXTRA, "")
+    try:
+        return _gql_raw(domain, query, session, variables)
+    except _Fail as e:
+        # старый/новый сервер не знает поле жанров — повторяем без него (жанры не обязательны)
+        if _extra_ok and FIELDS_EXTRA in query and "genres" in str(e):
+            _extra_ok = False
+            return _gql_raw(domain, query.replace(FIELDS_EXTRA, ""), session, variables)
+        raise
+
+
+def _gql_raw(domain: str, query: str, session: requests.Session, variables: dict | None = None) -> list:
     r = _request("POST", f"{domain}/api/graphql", session, json={"query": query, "variables": variables or {}})
     if r.status_code != 200:
         raise _http_fail(r, "GraphQL")

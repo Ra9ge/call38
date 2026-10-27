@@ -17,6 +17,11 @@ FONT_FILES = {
     "unbounded": "Unbounded[wght].ttf",    # широкий жирный — как «ОТЕЛЬ ◆ ДЛЯ ◆ НЕЛЮДЕЙ»
     "rubik": "Rubik[wght].ttf",            # универсальный жирный
     "tinos": "Tinos-Bold.ttf",             # с засечками (жирный) — для тонких «минтё»-логотипов
+    "dela": "DelaGothicOne-Regular.ttf",   # жирный «японский плакатный» — экшен, сёнэн
+    "dirt": "RubikDirt-Regular.ttf",       # потёртый — хоррор, потёртые логотипы
+    "rounded": "MPLUSRounded1c-Black.ttf",  # округлый — романтика, комедия, повседневность
+    "russo": "RussoOne-Regular.ttf",       # «техно» — меха, фантастика
+    "playfair": "PlayfairDisplay[wght].ttf",  # с засечками, очень жирный — изящные логотипы
 }
 SS = 2  # рисуем в 2 раза крупнее и уменьшаем — так края чище
 

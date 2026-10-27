@@ -13,10 +13,12 @@ from PIL import Image, ImageFilter
 
 from .compose import (add_badge, add_watermark, badge_reserve, detect_faces, render_overlay, render_replacement,
                       watermark_rect)
-from .detect import detect_text, find_logo
-from .inpaint import inpaint
+from .block import CLASS_RU, main_style, render_block, use_block
+from .compose import row_geoms
+from .detect import TextBox, detect_text, find_logo, reread_vertical
+from .inpaint import halo_mask, inpaint
 from .logo import analyze_logo, text_removal_mask
-from .titles import clean_title, resolve_titles, title_variants
+from .titles import clean_title, display_title, resolve_titles, title_match, title_variants
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -29,7 +31,7 @@ class Options:
     logo: Path | None = ROOT / "assets" / "logo.png"
     logo_corner: str = "tl"
     inpaint: str = "auto"               # auto | lama | opencv
-    font: str | None = None             # принудительно: comfortaa | rubik | montserrat | путь к .ttf
+    font: str | None = None             # принудительно: heavy | grunge | rounded | tech | serif | путь к .ttf
     playful: bool = True                # «прыгающие» буквы для милых логотипов
     keep_other_text: bool = False       # не стирать мелкий японский текст
     title: str | None = None            # своё русское название
@@ -50,6 +52,8 @@ class Report:
     label: str | None = None
     subtitle: str | None = None
     logo: str | None = None              # какой логотип нашёлся: «японский», «латиница» или None
+    font: str | None = None              # каким шрифтом нарисовано название
+    warnings: list[str] = field(default_factory=list)
 
 
 VERBOSE = True   # в ночном режиме шаги каждого постера не печатаем
@@ -86,6 +90,52 @@ def find_logo_subtitle(boxes, cluster, skip=()) -> list:
     return out
 
 
+def _union_boxes(boxes):
+    return (min(b.x0 for b in boxes), min(b.y0 for b in boxes), max(b.x1 for b in boxes), max(b.y1 for b in boxes))
+
+
+def residual_text(clean: np.ndarray, mask: np.ndarray, logo_mask: np.ndarray | None = None,
+                  reach: float = 0.0) -> list:
+    """Текст, который остался после стирания: на месте стирания или рядом с логотипом —
+    кусок названия, который распознаватель сначала не нашёл (верхний иероглиф столбика и т.п.).
+    Область логотипа проверяем отдельным крупным кадром: на всём постере мелочь теряется."""
+    if not mask.any():
+        return []
+    H, W = mask.shape
+    near = cv2.dilate(mask, np.ones((15, 15), np.uint8)) > 0
+    around = None
+    regions = []
+    if logo_mask is not None and reach > 0 and logo_mask.any():
+        around = cv2.distanceTransform((logo_mask == 0).astype(np.uint8), cv2.DIST_L2, 3) <= reach
+        regions.append(around)
+    regions.append(mask > 0)
+    out, seen = [], []
+    for reg in regions:
+        ys, xs = np.nonzero(reg)
+        pad = int(0.03 * H)
+        x0, y0 = max(0, xs.min() - pad), max(0, ys.min() - pad)
+        x1, y1 = min(W, xs.max() + pad), min(H, ys.max() + pad)
+        for b in detect_text(np.ascontiguousarray(clean[y0:y1, x0:x1])):
+            if b.score < 0.5 or b.size < 0.012 * H:
+                continue
+            g = TextBox(b.quad + np.float32([x0, y0]), b.text, b.score)
+            if any(abs(g.cx - o.cx) < 0.3 * o.size and abs(g.cy - o.cy) < 0.3 * o.size for o in seen):
+                continue                                   # уже нашли в другом кадре
+            bm = g.mask((H, W)) > 0
+            if not bm.any():
+                continue
+            wordy = g.cjk or sum(c.isalnum() for c in g.text) >= 2
+            if wordy and near[bm].mean() > 0.5:
+                out.append(g)
+            elif around is not None and around[bm].mean() > 0.5 and (
+                    g.cjk or (g.size >= 0.4 * reach and g.score >= 0.7)):
+                # рядом с логотипом: японский текст или уверенно найденная буква размером с буквы
+                # логотипа (одиночный иероглиф распознаватель часто читает латиницей: «ワ» → «D»)
+                out.append(g)
+            seen.append(g)
+    return out
+
+
 def _all_caps(text: str) -> bool:
     letters = [c for c in text if c.isalpha()]
     return len(letters) >= 3 and all(c.isupper() for c in letters)
@@ -107,10 +157,10 @@ def subtitle_text(ocr: str, info) -> str:
             continue
         cand = clean_title(cand)
         r = SequenceMatcher(None, norm(ocr), norm(cand)).ratio()
-        if r >= 0.9 and ocr.count(" ") >= cand.count(" "):
-            return ocr          # совпало — оставляем как на постере (регистр букв и т.п.)
+        if norm(ocr) == norm(cand) and ocr.count(" ") >= cand.count(" "):
+            return ocr          # совпало буква в букву — оставляем как на постере (регистр и т.п.)
         if r >= 0.7:
-            return _case_like(cand, ocr)
+            return _case_like(cand, ocr)      # распознано с ошибками — берём название с Shikimori
     return ocr
 
 
@@ -118,6 +168,9 @@ def latin_logo_subtitle(found, info) -> str | None:
     """Под русским названием — оригинальное название с логотипа (как «HUNTER × HUNTER»)."""
     ocr = " ".join(b.text for r in found.cluster.rows for b in r.boxes)
     cand = found.matched_title if found.match >= 0.6 else (getattr(info, "english", None) or info.name)
+    english = getattr(info, "english", None)
+    if english and title_match(ocr, [english])[0] >= 0.6:
+        cand = english                       # английское название понятнее ромадзи
     if not cand or cand == getattr(info, "russian", None) or not re.search(r"[A-Za-z]", cand):
         cand = getattr(info, "english", None) or getattr(info, "name", None)
     if not cand:
@@ -136,13 +189,11 @@ def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple
     seed = int(getattr(info, "id", 0) or 0)
 
     parsed, sub = resolve_titles(info)
-    title = opts.title or parsed.title
     label = parsed.label if opts.label is None else (opts.label or None)
     subtitle = sub if opts.subtitle is None else (opts.subtitle or None)
-    rep.title, rep.label, rep.subtitle = title, label, subtitle
 
     log("Ищу текст на постере...")
-    boxes = detect_text(arr)
+    boxes = reread_vertical(arr, detect_text(arr), title_variants(info))
     found = find_logo(boxes, arr.shape, title_variants(info))
     cluster, others = found.cluster, found.others
     rep.japanese = [b.text for b in boxes if b.cjk]
@@ -155,6 +206,13 @@ def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple
         log("Название на постере не найдено — делаю наложение.")
         mode = "overlay"
     rep.mode = mode
+    if mode == "replace":
+        # на месте логотипа — название с номером сезона в конце («… 2»), без отдельной подписи сезона
+        title = opts.title or display_title(info)
+        label = opts.label or None
+    else:
+        title = opts.title or parsed.title     # наложение: подпись «ВТОРОЙ СЕЗОН» над названием, как на образце
+    rep.title, rep.label, rep.subtitle = title, label, subtitle if mode == "overlay" else None
 
     mask = np.zeros(arr.shape[:2], np.uint8)
     la = None
@@ -172,8 +230,10 @@ def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple
             logo_sub_size = max(b.size for b in sub_boxes)
         if opts.subtitle is not None:
             logo_sub = opts.subtitle or None
+        rep.subtitle = logo_sub
         la = analyze_logo(arr, cluster, extra=sub_boxes + found.decor)
         mask |= la.mask
+        mask |= halo_mask(arr, la.mask, cluster.size)      # тень/свечение букв — тоже стираем
         for b in cluster.boxes:
             st = la.styles[id(b)]
             rep.styles.append(f"{b.text}: {st.kind}, цвета {len(st.glyph_colors)}")
@@ -183,8 +243,26 @@ def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple
             mask |= text_removal_mask(arr.shape, other_boxes)
 
     if mask.any():
-        log("Стираю японский текст...")
+        log("Стираю старое название...")
         clean, rep.inpaint = inpaint(arr, mask, opts.inpaint)
+        # проверка: не осталось ли на этом месте текста; если остался — стираем ещё раз
+        logo_mask = la.mask if la is not None else None
+        reach = 1.2 * cluster.size if la is not None else 0.0
+        for _ in range(2):
+            left = residual_text(clean, mask, logo_mask, reach)
+            if not left:
+                break
+            extra = np.zeros_like(mask)
+            for b in left:
+                piece = cv2.dilate(b.mask(arr.shape), cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * int(b.size * 0.3) + 7,) * 2))
+                extra |= piece | halo_mask(arr, piece, b.size)
+            mask |= extra
+            # дорисовываем только найденные остатки, остальное уже чистое
+            clean, rep.inpaint = inpaint(clean, extra, opts.inpaint)
+        else:
+            if residual_text(clean, mask, logo_mask, reach):
+                rep.warnings.append("старый текст стёрся не полностью")
     else:
         clean = arr
 
@@ -193,13 +271,22 @@ def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple
     logo_rect = watermark_rect(out.size, Path(opts.logo), corner=opts.logo_corner) if opts.logo else None
     badge_gap, badge_cap = 0.8, None
     if mode == "replace":
-        log("Рисую русское название в стиле оригинала...")
+        log("Рисую русское название...")
         badge_gap = -0.3   # плашка чуть заходит на тень/обводку названия
         reserve = badge_reserve(out.height, badge_gap) if opts.badge else 0.0
-        area, _ = render_replacement(out, cluster, la, title, font=opts.font, playful=opts.playful, seed=seed,
-                                     bottom_reserve=reserve, label=label, subtitle=logo_sub,
-                                     sub_size=logo_sub_size, avoid=logo_rect, upper=found.latin and _all_caps(
-                                         " ".join(b.text for b in cluster.boxes)))
+        drop = any(g.drop for g in row_geoms(cluster.rows, None))
+        if use_block(la) and not (drop and main_style(la, cluster).thin):
+            region = _union_boxes(list(cluster.boxes) + list(sub_boxes) + list(found.decor))
+            area, cls = render_block(out, cluster, la, title, logo_sub, genres=getattr(info, "genres", ()),
+                                     forced_font=opts.font, region=region, avoid=logo_rect, bottom_reserve=reserve)
+            rep.font = CLASS_RU.get(cls, cls)
+        else:
+            # разноцветные буквы, таблички, буквица — копия оригинального логотипа
+            area, fc = render_replacement(out, cluster, la, title, font=opts.font, playful=opts.playful, seed=seed,
+                                          bottom_reserve=reserve, label=label, subtitle=logo_sub,
+                                          sub_size=logo_sub_size, avoid=logo_rect,
+                                          upper=found.latin and _all_caps(" ".join(b.text for b in cluster.boxes)))
+            rep.font = "копия оригинала"
     else:
         log("Добавляю название поверх постера...")
         faces = detect_faces(clean)

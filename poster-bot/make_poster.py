@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--title", help="своё русское название вместо названия с Shikimori")
     p.add_argument("--label", help='подпись над названием, например "ВТОРОЙ СЕЗОН" ("" — убрать)')
     p.add_argument("--subtitle", help='подпись под названием ("" — убрать)')
-    p.add_argument("--font", help="шрифт для замены: comfortaa / rubik / montserrat / путь к .ttf")
+    p.add_argument("--font", help="шрифт названия: heavy (жирный) / grunge (потёртый) / rounded (округлый) / tech / serif (с засечками) / путь к .ttf")
     p.add_argument("--no-fun", action="store_true", help="без «прыгающих» букв")
     p.add_argument("--keep-other-text", action="store_true", help="не стирать мелкий японский текст")
     p.add_argument("--inpaint", choices=["auto", "lama", "opencv"], default="auto",

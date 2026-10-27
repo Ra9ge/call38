@@ -127,7 +127,10 @@ def _lama_run(sess, crop: np.ndarray, cmask: np.ndarray) -> np.ndarray | None:
     size = img_in.shape[-1] if isinstance(img_in.shape[-1], int) else 512
     h, w = crop.shape[:2]
     im = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32)
-    m = (cv2.resize(cmask, (size, size), interpolation=cv2.INTER_NEAREST) > 0).astype(np.float32)
+    # маска при уменьшении: пиксель закрыт, если под ним есть хоть кусочек маски (+1 пиксель запаса) —
+    # иначе краешки старых букв остаются видны модели, и она дорисовывает из них «призрак» надписи
+    m = cv2.resize((cmask > 0).astype(np.float32), (size, size), interpolation=cv2.INTER_AREA) > 0.003
+    m = cv2.dilate(m.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32)
     keep = m < 0.5
     im_in = im * keep[..., None]
     # Модель ожидает картинку 0..1; на всякий случай проверяем результат и пробуем 0..255.
@@ -151,11 +154,18 @@ def inpaint_lama(img: np.ndarray, mask: np.ndarray, allow_download: bool = True)
     H, W = img.shape[:2]
     out = img.copy()
     n, lab, st, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
-    # соседние куски обрабатываем одним окном
+    # соседние куски обрабатываем одним окном; совсем мелкие надписи (титры, даты) — быстрым
+    # способом OpenCV: на тонкой строчке его размытие не видно, а нейросеть — это ~2 с на окно
     boxes = []
+    tiny = np.zeros(mask.shape, np.uint8)
     for i in range(1, n):
         x, y, w, h, _ = st[i]
+        if h < 0.022 * H:
+            tiny[lab == i] = 255
+            continue
         boxes.append([x, y, x + w, y + h])
+    if tiny.any():
+        out = inpaint_opencv(out, tiny)
     merged = []
     for b in sorted(boxes):
         for m in merged:
@@ -164,23 +174,65 @@ def inpaint_lama(img: np.ndarray, mask: np.ndarray, allow_download: bool = True)
                 break
         else:
             merged.append(list(b))
+    remaining = mask > 0
     for x0, y0, x1, y1 in merged:
-        side = int(max(x1 - x0, y1 - y0) * 1.6) + 64
-        side = min(max(side, 256), max(H, W))
+        for ax0, ay0, ax1, ay1, core in _windows(x0, y0, x1, y1, W, H):
+            crop = out[ay0:ay1, ax0:ax1]
+            hide = remaining[ay0:ay1, ax0:ax1]            # модель не должна видеть ни одной старой буквы,
+            cm = hide & core                              # а записываем только свою часть окна
+            if not cm.any():
+                continue
+            res = _lama_run(sess, crop, hide.astype(np.uint8) * 255)
+            if res is None:
+                log("LaMa дала странный результат, использую OpenCV")
+                return None
+            soft = cv2.GaussianBlur(cm.astype(np.float32), (0, 0), 1.5)
+            soft = np.maximum(soft, cm.astype(np.float32))[..., None]
+            out[ay0:ay1, ax0:ax1] = (res * soft + crop * (1 - soft)).astype(np.uint8)
+            remaining[ay0:ay1, ax0:ax1] &= ~cm
+    return out
+
+
+def _windows(x0, y0, x1, y1, W, H):
+    """Окна для LaMa. Модель работает в 512×512, поэтому большую надпись (логотип во всю ширину)
+    не ужимаем в одно окно, а идём окнами с перекрытием почти в родном масштабе: каждое следующее
+    окно видит уже дорисованный кусок как готовый фон. core — какую часть окна дорисовывать сейчас
+    (хвост оставляем следующему окну — у него будет больше фона вокруг)."""
+    bw, bh = x1 - x0, y1 - y0
+    short, long_ = min(bw, bh), max(bw, bh)
+    if long_ * 1.25 + 64 <= 960:
+        # всё помещается в одно окно (уменьшение до ~1.9 раза почти не заметно)
+        side = int(min(max(short * 2.2 + 96, long_ * 1.25 + 64, 256), max(H, W)))
         cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
         ax0 = int(np.clip(cx - side // 2, 0, max(0, W - side)))
         ay0 = int(np.clip(cy - side // 2, 0, max(0, H - side)))
         ax1, ay1 = min(W, ax0 + side), min(H, ay0 + side)
-        crop = out[ay0:ay1, ax0:ax1]
-        cm = mask[ay0:ay1, ax0:ax1]
-        res = _lama_run(sess, crop, cm)
-        if res is None:
-            log("LaMa дала странный результат, использую OpenCV")
-            return None
-        soft = cv2.GaussianBlur((cm > 0).astype(np.float32), (0, 0), 1.5)
-        soft = np.maximum(soft, (cm > 0).astype(np.float32))[..., None]
-        out[ay0:ay1, ax0:ax1] = (res * soft + crop * (1 - soft)).astype(np.uint8)
-    return out
+        yield ax0, ay0, ax1, ay1, np.ones((ay1 - ay0, ax1 - ax0), bool)
+        return
+    side = int(min(max(short * 2.2 + 96, 640), 960, H, W))
+
+    def starts(a0, a1, lim):
+        """Начала окон вдоль одной оси (с перекрытием), чтобы покрыть [a0, a1]."""
+        if a1 - a0 + 0.4 * side <= side:                  # по этой оси хватает одного окна
+            return [int(np.clip((a0 + a1) / 2 - side / 2, 0, max(0, lim - side)))]
+        out, s = [], a0 - int(side * 0.2)
+        while True:
+            out.append(int(np.clip(s, 0, max(0, lim - side))))
+            if s + side >= a1 + int(side * 0.2) or out[-1] >= lim - side:
+                return out
+            s += int(side * 0.55)
+
+    xs, ys = starts(x0, x1, W), starts(y0, y1, H)
+    cut = int(side * 0.78)                                # хвост окна дорисует следующее окно
+    for j, sy in enumerate(ys):
+        for i, sx in enumerate(xs):
+            ax0, ay0, ax1, ay1 = sx, sy, min(W, sx + side), min(H, sy + side)
+            core = np.ones((ay1 - ay0, ax1 - ax0), bool)
+            if i < len(xs) - 1:
+                core[:, cut:] = False
+            if j < len(ys) - 1:
+                core[cut:, :] = False
+            yield ax0, ay0, ax1, ay1, core
 
 
 def inpaint_opencv(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -222,3 +274,43 @@ def inpaint(img: np.ndarray, mask: np.ndarray, method: str = "auto") -> tuple[np
             return res, "lama"
         log("LaMa недоступна — стираю встроенным способом (OpenCV).")
     return inpaint_opencv(img, mask), "opencv"
+
+
+def halo_mask(img: np.ndarray, mask: np.ndarray, h: float) -> np.ndarray:
+    """Тень и свечение вокруг букв — то, что не попало в маску букв, но после стирания
+    остаётся тёмным (или светлым) «призраком» надписи.
+
+    Смотрим полосу вокруг маски шириной ~0.2 высоты букв и сравниваем с фоном чуть дальше
+    (оценка фона в каждой точке — сглаженный цвет внешнего кольца). Что заметно темнее фона
+    или сильно отличается по цвету — добавляем к маске (только куски, примыкающие к буквам)."""
+    m = mask > 0
+    if not m.any() or h <= 0:
+        return np.zeros_like(mask)
+    r = max(3, int(round(0.2 * h)))
+    ys, xs = np.where(m)
+    pad = 3 * r
+    Hh, Ww = mask.shape[:2]
+    y0, y1 = max(0, ys.min() - pad), min(Hh, ys.max() + pad + 1)
+    x0, x1 = max(0, xs.min() - pad), min(Ww, xs.max() + pad + 1)
+    mm = m[y0:y1, x0:x1].astype(np.uint8)
+    lab = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    dist = cv2.distanceTransform((mm == 0).astype(np.uint8), cv2.DIST_L2, 3)   # до ближайшей буквы
+    near = (dist <= r) & (mm == 0)
+    outer = ((dist <= 2.6 * r) & (dist > 1.4 * r)).astype(np.float32)
+    sig = 1.6 * r
+    den = cv2.GaussianBlur(outer, (0, 0), sig)
+    est = cv2.GaussianBlur(lab * outer[..., None], (0, 0), sig) / np.maximum(den, 1e-6)[..., None]
+    valid = den > 0.03
+    dL = lab[..., 0] - est[..., 0]
+    dE = np.linalg.norm(lab - est, axis=2)
+    halo = near & valid & ((dL < -14) | (dE > 30))
+    # только куски, которые касаются букв
+    n, lab_cc = cv2.connectedComponents((halo | (mm > 0)).astype(np.uint8))
+    touch = np.unique(lab_cc[mm > 0])
+    keep = np.isin(lab_cc, touch[touch > 0]) & halo
+    keep = cv2.morphologyEx(keep.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    keep = cv2.dilate(keep, np.ones((3, 3), np.uint8))
+    out = np.zeros_like(mask)
+    out[y0:y1, x0:x1] = np.where(keep > 0, 255, 0).astype(mask.dtype)
+    return out

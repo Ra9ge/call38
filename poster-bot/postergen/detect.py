@@ -94,7 +94,9 @@ class Cluster:
 
 def detect_text(img_rgb: np.ndarray) -> list[TextBox]:
     # режимы указываем явно: движок запоминает параметры прошлого вызова
-    res = _engine()(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), use_det=True, use_cls=True, use_rec=True)
+    # use_cls=False: модуль «текст вверх ногами?» на увеличенных постерах переворачивает
+    # нормальный японский текст, и он читается как мусор; на постерах перевёрнутого текста не бывает
+    res = _engine()(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), use_det=True, use_cls=False, use_rec=True)
     if res.boxes is None:
         return []
     return [TextBox(b, t, float(s)) for b, t, s in zip(res.boxes, res.txts, res.scores) if t.strip()]
@@ -162,8 +164,10 @@ def find_logo(boxes: list[TextBox], img_shape, variants: list[str] = (), min_sco
     """
     from .titles import title_match
 
-    H = img_shape[0]
-    cands = [b for b in boxes if b.score >= min_score and b.size >= 0.015 * H and _letters(b.text) >= 1]
+    H, W = img_shape[:2]
+    # крупный текст берём, даже если он прочитан неуверенно (стилизованные логотипы читаются плохо)
+    cands = [b for b in boxes if _letters(b.text) >= 1 and b.size >= 0.015 * H
+             and (b.score >= min_score or (b.size >= 0.05 * H and b.score >= 0.2))]
     clusters = [Cluster(g) for g in _group(cands)]
     best, best_score, best_info = None, 0.0, (0.0, None)
     for c in clusters:
@@ -176,14 +180,17 @@ def find_logo(boxes: list[TextBox], img_shape, variants: list[str] = (), min_sco
             if m > match:
                 match, which = m, w
         size = main.size / H
+        wide = sum(b.run for b in main_parts) >= 0.25 * W
         if main.cjk:
-            ok = size >= 0.045 or (match >= 0.6 and size >= 0.025)
+            ok = (size >= 0.045 and main.score >= min_score) or (match >= 0.6 and size >= 0.025)
         else:
             ok = (match >= 0.6 and size >= 0.03 and _letters(text) >= 3) \
                 or (size >= 0.07 and _letters(text) >= 3 and main.score >= 0.6)
-        if not ok:
+        # не прочиталось, но это большая широкая текстовая область — почти наверняка логотип
+        unreadable = not ok and size >= 0.08 and wide and main.score >= 0.2
+        if not (ok or unreadable):
             continue
-        score = main.size * math.sqrt(sum(b.run for b in main_parts)) * (1 + 1.5 * match)
+        score = main.size * math.sqrt(sum(b.run for b in main_parts)) * (1 + 1.5 * match) * (0.5 if unreadable else 1)
         if score > best_score:
             best, best_score, best_info = c, score, (match, which)
 
@@ -220,3 +227,156 @@ def find_title(boxes: list[TextBox], img_shape, variants: list[str] = ()) -> tup
     """Старый интерфейс: (кластер логотипа или None, прочий японский текст)."""
     f = find_logo(boxes, img_shape, variants)
     return f.cluster, f.others
+
+
+# ---------------------------------------------------------------- вертикальный текст
+def _read_line(img_rgb: np.ndarray) -> tuple[str, float]:
+    """Распознать одну горизонтальную строку (без поиска текста)."""
+    res = _engine()(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), use_det=False, use_cls=False, use_rec=True)
+    txts = getattr(res, "txts", None) or ()
+    scores = getattr(res, "scores", None) or ()
+    if not txts:
+        return "", 0.0
+    return str(txts[0]).strip(), float(scores[0])
+
+
+def _cells_strip(img: np.ndarray, x0: int, x1: int, ys: list[float]) -> np.ndarray:
+    """Столбик иероглифов → строка: каждая клетка столбика ставится в ряд слева направо."""
+    w = x1 - x0
+    side = 64
+    cells = []
+    for a, b in zip(ys[:-1], ys[1:]):
+        c = img[int(round(a)):int(round(b)), x0:x1]
+        if c.size == 0:
+            continue
+        k = side / max(w, b - a)
+        c = cv2.resize(c, (max(1, int(w * k)), max(1, int((b - a) * k))), interpolation=cv2.INTER_AREA)
+        pad = np.zeros((side, side, 3), np.uint8) + np.median(c.reshape(-1, 3), 0).astype(np.uint8)
+        oy, ox = (side - c.shape[0]) // 2, (side - c.shape[1]) // 2
+        pad[oy:oy + c.shape[0], ox:ox + c.shape[1]] = c
+        cells.append(pad)
+    strip = np.concatenate(cells, 1)
+    return cv2.copyMakeBorder(strip, 8, 8, 12, 12, cv2.BORDER_REPLICATE)
+
+
+def _cjk_count(t: str) -> int:
+    return len(CJK_RE.findall(t))
+
+
+def reread_vertical(img: np.ndarray, boxes: list[TextBox], variants=()) -> list[TextBox]:
+    """Вертикальные японские названия (столбиком вдоль края постера).
+
+    Распознаватель читает только строки, поэтому столбик читается мусором, режется на куски
+    или находится только один иероглиф. Находим высокие узкие столбики (или отдельный крупный
+    иероглиф), режем на клетки (подбираем шаг и сдвиг), ставим клетки в ряд и читаем заново;
+    столбик продлеваем вверх и вниз, пока клетки читаются как иероглифы.
+    """
+    from .titles import title_match
+    H, W = img.shape[:2]
+
+    def tall_box(b):
+        return b.y1 - b.y0 >= 1.5 * (b.x1 - b.x0) and b.x1 - b.x0 >= 0.03 * W
+
+    def one_char(b):
+        h, w = b.y1 - b.y0, b.x1 - b.x0
+        return len(b.text.strip()) <= 2 and 0.7 <= h / max(1.0, w) <= 1.5 and h >= 0.035 * H
+
+    tall = [b for b in boxes if tall_box(b)]
+    cols: list[list[TextBox]] = []
+    for b in sorted(tall, key=lambda b: b.y0):
+        for col in cols:
+            cx0, cx1 = min(c.x0 for c in col), max(c.x1 for c in col)
+            ov = min(cx1, b.x1) - max(cx0, b.x0)
+            gap = b.y0 - max(c.y1 for c in col)
+            if ov >= 0.6 * min(cx1 - cx0, b.x1 - b.x0) and gap < 0.8 * (cx1 - cx0):
+                col.append(b)
+                break
+        else:
+            cols.append([b])
+    for col in cols:      # кусочки того же столбика сверху/снизу, прочитанные как латиница («S»)
+        cx0, cx1 = min(c.x0 for c in col), max(c.x1 for c in col)
+        for b in boxes:
+            if b in col or b in tall:
+                continue
+            ov = min(cx1, b.x1) - max(cx0, b.x0)
+            near = min(abs(b.y0 - max(c.y1 for c in col)), abs(min(c.y0 for c in col) - b.y1))
+            if ov >= 0.6 * (b.x1 - b.x0) and (b.x1 - b.x0) >= 0.5 * (cx1 - cx0) and near < 0.8 * (cx1 - cx0):
+                col.append(b)
+    used = {id(b) for col in cols for b in col}
+    singles = [[b] for b in boxes if id(b) not in used and one_char(b)]
+
+    def score_of(text, sc):
+        if _cjk_count(text) < 2:
+            return 0.0
+        m = title_match(text, list(variants))[0] if variants else 0.0
+        return sc * (1 + 2 * m)
+
+    def read(x0, x1, ys):
+        return _read_line(_cells_strip(img, x0, x1, ys))
+
+    def grow(x0, x1, ys):
+        """Продлить столбик: новая клетка читается вместе с соседней — по одному иероглифу
+        распознаватель ошибается чаще."""
+        step = ys[1] - ys[0]
+        for _ in range(12):
+            a = ys[0] - step
+            if a < -0.15 * step:
+                break
+            t, sc = read(x0, x1, [max(0.0, a), ys[0], ys[1]])
+            if _cjk_count(t) < 2 or sc < 0.55:
+                break
+            ys.insert(0, max(0.0, a))
+        for _ in range(12):
+            b_ = ys[-1] + step
+            if b_ > H + 0.15 * step:
+                break
+            t, sc = read(x0, x1, [ys[-2], ys[-1], min(float(H), b_)])
+            if _cjk_count(t) < 2 or sc < 0.55:
+                break
+            ys.append(min(float(H), b_))
+        return ys
+
+    out = list(boxes)
+    for col in cols + singles:
+        x0 = int(max(0, min(c.x0 for c in col)))
+        x1 = int(min(W, max(c.x1 for c in col)))
+        y0, y1 = float(min(c.y0 for c in col)), float(max(c.y1 for c in col))
+        w, h = x1 - x0, y1 - y0
+        old_best = max(score_of(c.text, c.score) for c in col)
+        cands = []
+        if len(col) == 1 and one_char(col[0]):
+            for k in (0.75, 0.88, 1.0, 1.12):        # шаг — высота одного иероглифа (± промежуток)
+                ys = grow(x0, x1, [y0, y0 + h * k])
+                if len(ys) >= 4:                      # хотя бы три иероглифа столбиком
+                    cands.append(ys)
+        else:
+            for k in (0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1):
+                p = w * k
+                for off in (0.0, -p / 3, p / 3):
+                    a, b_ = y0 + off, y1 + off
+                    n = int(round((b_ - a) / p))
+                    if n < 2 or a < 0 or b_ > H:
+                        continue
+                    cands.append(list(np.linspace(a, b_, n + 1)))
+        best = None
+        for ys in cands:
+            t, sc = read(x0, x1, ys)
+            sc_ = score_of(t, sc)
+            if best is None or sc_ > best[0]:
+                best = (sc_, ys)
+        if best is None or best[0] <= 0:
+            continue
+        ys = best[1] if len(col) == 1 and one_char(col[0]) else grow(x0, x1, list(best[1]))
+        text, sc = read(x0, x1, ys)
+        if score_of(text, sc) <= max(0.3, old_best):
+            continue
+        quad = np.float32([[x0, ys[0]], [x1, ys[0]], [x1, ys[-1]], [x0, ys[-1]]])
+
+        def inside(b):          # кусок, который почти целиком внутри нового столбика
+            ix = min(x1, b.x1) - max(x0, b.x0)
+            iy = min(ys[-1], b.y1) - max(ys[0], b.y0)
+            return ix > 0 and iy > 0 and ix * iy >= 0.6 * (b.x1 - b.x0) * (b.y1 - b.y0)
+
+        out = [b for b in out if b not in col and not inside(b)]
+        out.append(TextBox(quad, text, sc))
+    return out

@@ -91,3 +91,32 @@ def test_list_rest_fallback_and_bad_args(monkeypatch):
     assert [a.id for a in list_animes(1, kind="tv")] == [9]
     with pytest.raises(ValueError):
         list_animes(1, kind='tv") { evil }')
+
+
+def test_graphql_genres_and_fallback_without_them(monkeypatch):
+    seen = []
+
+    def fake_request(self, method, url, timeout=None, **kw):
+        q = kw["json"]["query"]
+        seen.append("genres" in q)
+        if "genres" in q:
+            return FakeResp(200, {"errors": [{"message": "Field 'genres' doesn't exist on type 'Anime'"}], "data": None})
+        return FakeResp(200, {"data": {"animes": [{"id": "1", "name": "A", "russian": "А"}]}})
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    monkeypatch.setattr(shikimori, "_extra_ok", True)
+    assert fetch_anime(1).russian == "А"
+    assert seen == [True, False]
+    assert fetch_anime(1).genres == []          # дальше уже без жанров, сразу
+    assert seen[-1] is False and len(seen) == 3
+
+
+def test_graphql_genres_parsed(monkeypatch):
+    def fake_request(self, method, url, timeout=None, **kw):
+        return FakeResp(200, {"data": {"animes": [{"id": "1", "name": "A", "russian": "А",
+                                                   "genres": [{"name": "Romance", "russian": "Романтика", "kind": "genre"},
+                                                              {"name": "School", "russian": "Школа", "kind": "theme"}]}]}})
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    monkeypatch.setattr(shikimori, "_extra_ok", True)
+    assert fetch_anime(1).genres == ["Romance", "School"]

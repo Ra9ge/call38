@@ -194,3 +194,23 @@ def title_words(title: str) -> list[str]:
         else:
             out.append(w)
     return out
+
+
+def display_title(info) -> str:
+    """Русское название как есть, с номером сезона в конце («Код Гиас: Восставший Лелуш R2»,
+    «Отель для нелюдей 2»). «[ТВ-2]» → « 2», прочие хвостовые скобки «(2011)» убираются."""
+    raw = " ".join(((getattr(info, "russian", None) or getattr(info, "name", "")) or "").split())
+    m = re.search(r"\s*[\(\[]\s*(?:тв|tv)[\s-]*(\d{1,2})\s*[\)\]]\s*$", raw, re.I)
+    if m:
+        n = int(m.group(1))
+        raw = raw[:m.start()].strip() + (f" {n}" if n >= 2 else "")
+    t = clean_title(raw)
+    if not re.search(r"\d|\b[IVX]{2,4}\b", t):
+        # номер сезона есть только в английском/ромадзи названии — добавим цифрой
+        kind = getattr(info, "kind", None)
+        for alt in (getattr(info, "english", None), getattr(info, "name", None)):
+            if alt:
+                p = parse_title(alt, allow_trailing_number=kind not in ("movie", "music"))
+                if p.season and p.season >= 2:
+                    return f"{t} {p.season}"
+    return t

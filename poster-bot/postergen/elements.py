@@ -18,6 +18,14 @@ def _glyph_layer(sh: Shaped, colors) -> tuple[Layer, np.ndarray]:
     return lay, a
 
 
+def cap_band(sh: Shaped) -> np.ndarray:
+    """Полоса «от верха заглавных до строки» — точка привязки по высоте заглавных букв,
+    чтобы строки с «Й», «Ё», «Щ» стояли ровно."""
+    band = np.zeros((sh.h, sh.w), np.float32)
+    band[max(0, int(sh.baseline - sh.cap)):int(sh.baseline), :] = 1.0
+    return band
+
+
 def _pad(layer_or_alpha, p):
     if isinstance(layer_or_alpha, Layer):
         out = Layer(layer_or_alpha.a.shape[1] + 2 * p, layer_or_alpha.a.shape[0] + 2 * p)
@@ -29,7 +37,8 @@ def _pad(layer_or_alpha, p):
 def sticker_text(text: str, font: str, weight: int, cap: float, colors, outline_px: float,
                  outline_color=(255, 255, 255), shadow: bool = True, jitter=None, cases=None,
                  faux_bold: float = 0.0, tracking: float = 0.0, char_colors=None,
-                 drop_ratio: float = 0.0) -> Element:
+                 drop_ratio: float = 0.0, gradient=None, shadow_opacity: float = 0.5,
+                 cap_anchor: bool = False) -> Element:
     """Цветные буквы в общей обводке с мягкой тенью (как «СаКуРАсо»).
 
     char_colors — свой цвет для каждой буквы (например, красный предлог);
@@ -43,9 +52,19 @@ def sticker_text(text: str, font: str, weight: int, cap: float, colors, outline_
         rgb, fa = per_glyph_fill(sh, list(char_colors))
         glyphs = Layer(sh.w, sh.h)
         glyphs.rgb, glyphs.a = rgb, fa
+    elif gradient:
+        # заливка градиентом сверху вниз (по высоте букв)
+        fa = sh.alpha()
+        rows = np.nonzero(fa.max(1) > 0.05)[0]
+        y0, y1 = (rows.min(), rows.max()) if len(rows) else (0, sh.h - 1)
+        t = np.clip((np.arange(sh.h, dtype=np.float32) - y0) / max(1, y1 - y0), 0, 1)[:, None, None]
+        top, bot = (np.asarray(c, np.float32) for c in gradient)
+        cmap = np.broadcast_to(top * (1 - t) + bot * t, (sh.h, sh.w, 3))
+        glyphs = Layer(sh.w, sh.h)
+        glyphs.over(cmap, fa)
     else:
         glyphs, fa = _glyph_layer(sh, colors)
-    line_a = sh.line_alpha() if sh.drop else None
+    line_a = sh.line_alpha() if sh.drop else (cap_band(sh) if cap_anchor else None)
     ow = outline_px * SS
     p = int(ow * 2 + cap * SS * 0.25) + 4
     glyphs, fa = _pad(glyphs, p), _pad(fa, p)
@@ -55,7 +74,7 @@ def sticker_text(text: str, font: str, weight: int, cap: float, colors, outline_
     ring = dilate(fa, ow) if ow > 0 else fa
     if shadow:
         sa = blur(shift(ring, ow * 0.35 + cap * SS * 0.02, ow * 0.55 + cap * SS * 0.04), ow * 0.5 + 1.5)
-        out.over(SHADOW, sa, 0.5)
+        out.over(SHADOW, sa, shadow_opacity)
     if ow > 0 and outline_color:
         out.over(outline_color, ring)
     out.over_layer(glyphs)
@@ -128,18 +147,21 @@ def petal_text(text: str, font: str, weight: int, cap: float, petal_color, text_
 def outlined_text(text: str, font: str, weight: int, cap: float, fill=(255, 255, 255),
                   outline=None, outline_px: float = 0.0, shadow_opacity: float = 0.45,
                   halo_opacity: float = 0.0, tracking: float = 0.0, distress: float = 0.0,
-                  seed: int = 0) -> Element:
+                  seed: int = 0, cap_anchor: bool = False) -> Element:
     """Обычная надпись: заливка + обводка/ореол + тень (подписи, «НОВАЯ ОЗВУЧКА»)."""
     f = font_for_cap(font, cap * SS, weight)
     sh = shape_text(text, f, tracking=tracking)
     return _finish_single(sh.alpha(), cap, fill, outline, outline_px, shadow_opacity, halo_opacity,
-                          distress, seed)
+                          distress, seed, cap_band(sh) if cap_anchor else None)
 
 
-def _finish_single(fa, cap, fill, outline, outline_px, shadow_opacity, halo_opacity, distress, seed):
+def _finish_single(fa, cap, fill, outline, outline_px, shadow_opacity, halo_opacity, distress, seed,
+                   anchor=None):
     c = cap * SS
     p = int(c * 1.2 + outline_px * SS * 2) + 4
     fa = np.pad(fa, p)
+    if anchor is not None:
+        anchor = np.pad(anchor, p)
     if distress > 0:
         fa = grunge(fa, seed=seed, amount=distress)
     out = Layer(fa.shape[1], fa.shape[0])
@@ -151,7 +173,7 @@ def _finish_single(fa, cap, fill, outline, outline_px, shadow_opacity, halo_opac
     if outline and outline_px > 0:
         out.over(outline, ring)
     out.over(fill, fa)
-    return finish(out, fa)
+    return finish(out, fa, anchor)
 
 
 def word_line_alpha(words: list[str], font: str, weight: int, cap: float, tracking: float = 0.0,
