@@ -1,0 +1,347 @@
+"""Разбор оригинального японского логотипа: маска для удаления и стиль (цвета, обводка, плашки)."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
+
+from .detect import Cluster, TextBox, _rows
+
+
+def _ell(r: int) -> np.ndarray:
+    r = max(1, int(round(r)))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+
+@dataclass
+class BoxStyle:
+    kind: str                                   # sticker | plate | badge | plain
+    glyph_colors: list[tuple[int, int, int]]    # цвета букв слева направо
+    outline_color: tuple[int, int, int] | None
+    outline_ratio: float                        # толщина обводки / высота строки
+    plate_color: tuple[int, int, int] | None = None
+    plate_border: tuple[int, int, int] | None = None
+    shadow: bool = True
+    mask: np.ndarray | None = field(default=None, repr=False)
+
+
+class Analyzer:
+    def __init__(self, img: np.ndarray):
+        self.img = img
+        self.H, self.W = img.shape[:2]
+        f = img.astype(np.int16)
+        mn, mx = f.min(2), f.max(2)
+        self.white = ((mn > 200) & (mx - mn < 48)).astype(np.uint8) * 255
+        self.lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB).astype(np.float32)
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        self.colored = ((hsv[..., 1] > 45) & (hsv[..., 2] > 90)).astype(np.uint8) * 255
+
+    # ---------- цвета ----------
+    def _clusters(self, sel: np.ndarray, k: int = 6, merge_de: float = 22.0, min_share: float = 0.04):
+        """k-means по Lab, возвращает [(rgb, share, median_x, median_y)] отсортированные по доле."""
+        ys, xs = np.nonzero(sel)
+        if len(xs) < 12:
+            return []
+        if len(xs) > 30000:
+            idx = np.random.default_rng(0).choice(len(xs), 30000, replace=False)
+            ys, xs = ys[idx], xs[idx]
+        pts = self.lab[ys, xs]
+        k = int(min(k, max(1, len(pts) // 30)))
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+        _, labels, centers = cv2.kmeans(pts, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+        labels = labels.ravel()
+        groups = [[i] for i in range(k)]
+        # слить близкие цвета
+        changed = True
+        while changed:
+            changed = False
+            for a in range(len(groups)):
+                for b in range(a + 1, len(groups)):
+                    ca = pts[np.isin(labels, groups[a])].mean(0) if np.isin(labels, groups[a]).any() else centers[groups[a][0]]
+                    cb = pts[np.isin(labels, groups[b])].mean(0) if np.isin(labels, groups[b]).any() else centers[groups[b][0]]
+                    if np.linalg.norm((ca - cb) * np.array([0.5, 1, 1])) < merge_de:
+                        groups[a] += groups.pop(b)
+                        changed = True
+                        break
+                if changed:
+                    break
+        out = []
+        for g in groups:
+            m = np.isin(labels, g)
+            share = m.mean()
+            if share < min_share:
+                continue
+            lab = np.median(pts[m], 0).astype(np.uint8).reshape(1, 1, 3)
+            rgb = tuple(int(v) for v in cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)[0, 0])
+            out.append((rgb, float(share), float(np.median(xs[m])), float(np.median(ys[m]))))
+        out.sort(key=lambda c: -c[1])
+        return out
+
+    @staticmethod
+    def _is_whiteish(rgb) -> bool:
+        return min(rgb) > 200 and max(rgb) - min(rgb) < 48
+
+    def _is_tint(self, rgb, others) -> bool:
+        """Цвет — это смесь белого с другим цветом (сглаживание на краю обводки)?"""
+        c, w = self.lab_of(rgb), self.lab_of((255, 255, 255))
+        for o in others:
+            if o == rgb:
+                continue
+            ol = self.lab_of(o)
+            d = w - ol
+            t = float(np.clip(np.dot(c - ol, d) / max(1e-6, np.dot(d, d)), 0, 1))
+            if 0.15 < t < 0.95 and np.linalg.norm(ol + t * d - c) < 15:
+                return True
+        return False
+
+    def _ordered_colors(self, sel: np.ndarray, box: TextBox, extra_refs=(), **kw):
+        cl = [c for c in self._clusters(sel, **kw) if not self._is_whiteish(c[0])]
+        refs = [c[0] for c in cl] + list(extra_refs)
+        cl = [c for c in cl if not self._is_tint(c[0], refs)]
+        if not cl:
+            return []
+        if box.vertical:
+            cl.sort(key=lambda c: c[3])
+        else:
+            a = np.radians(box.angle)
+            cl.sort(key=lambda c: c[2] * np.cos(a) + c[3] * np.sin(a))
+        return [c[0] for c in cl]
+
+    # ---------- анализ одной строки ----------
+    def analyze_box(self, box: TextBox, exclude: np.ndarray | None = None) -> BoxStyle:
+        h = box.size
+        Q = box.mask(self.img.shape)
+        if exclude is not None:
+            Q &= ~exclude
+        area = max(1, int((Q > 0).sum()))
+
+        # 1) плашка: одна заливка занимает край рамки текста (жёлтая табличка, лепесток)
+        band = Q & ~cv2.erode(Q, _ell(max(2, h * 0.16)))
+        non_white_band = band & ~self.white
+        plate = None
+        if (band > 0).sum() > 20:
+            cl = self._clusters(non_white_band > 0, k=4, merge_de=18)
+            cl = [c for c in cl if max(c[0]) - min(c[0]) > 40]
+            if cl:
+                rgb = cl[0][0]
+                ref = self.lab_of(rgb)
+                near = lambda sel: (np.linalg.norm(self.lab[sel] - ref, axis=1) < 32).mean() if sel.any() else 0.0
+                in_share = near(band > 0)
+                far = (cv2.dilate(Q, _ell(h * 1.0)) & ~cv2.dilate(Q, _ell(h * 0.5))) > 0
+                if in_share > 0.35 and near(far) < 0.3:
+                    plate = rgb
+        if plate is not None:
+            return self._plate_style(box, Q, plate)
+
+        # 2) «стикер»: цветные буквы в толстой белой обводке
+        letters = self._sticker_letters(box, Q)
+        if (letters > 0).sum() > 0.06 * area:
+            return self._sticker_style(box, Q, letters)
+
+        # 3) всё остальное
+        return self._plain_style(box, Q)
+
+    def _plate_style(self, box, Q, plate_rgb):
+        h = box.size
+        diff = np.linalg.norm(self.lab - self.lab_of(plate_rgb), axis=2)
+        plate_px = ((diff < 22) & (self.white == 0)).astype(np.uint8) * 255
+        near = cv2.dilate(Q, _ell(h * 0.45))
+        plate_px &= near
+        # область плашки = связные куски нужного цвета, касающиеся рамки текста
+        n, lab, st, _ = cv2.connectedComponentsWithStats(cv2.morphologyEx(plate_px, cv2.MORPH_CLOSE, _ell(2)))
+        region = np.zeros_like(Q)
+        for i in range(1, n):
+            comp = lab == i
+            if (Q[comp] > 0).mean() > 0.15 or ((Q > 0) & comp).sum() > 0.2 * (Q > 0).sum():
+                region[comp] = 255
+        region |= Q
+        region = _fill_holes(region)
+        inside = cv2.erode(region, _ell(1)) & ~cv2.dilate(plate_px, _ell(1))
+        glyph_white = (self.white[inside > 0] > 0).mean() if (inside > 0).any() else 1.0
+        glyph_sel = (inside > 0) & (self.white == 0) & (self.colored > 0)
+        glyph_colors = self._ordered_colors(cv2.erode(glyph_sel.astype(np.uint8) * 255, _ell(1)) > 0, box,
+                                            extra_refs=[plate_rgb])
+        # белая каёмка вокруг плашки
+        ring = cv2.dilate(region, _ell(h * 0.2)) & ~region
+        border = (255, 255, 255) if (self.white[ring > 0] > 0).mean() > 0.35 else None
+        mask = region | (self.white & cv2.dilate(region, _ell(h * 0.2)))
+        mask = _fill_holes(mask)
+        if not glyph_colors or glyph_white > 0.55:
+            # белые буквы на цветной подложке (лепесток с «の»)
+            return BoxStyle("badge", [(255, 255, 255)], None, 0.0, plate_rgb, border, True, mask)
+        outline = (255, 255, 255) if glyph_white > 0.12 else None
+        return BoxStyle("plate", glyph_colors, outline, 0.09 if outline else 0.0, plate_rgb, border, True, mask)
+
+    def split_badge(self, box: TextBox, st: BoxStyle):
+        """Ищет внутри таблички цветной «лепесток» с белой буквой. -> (табличка, лепесток, цвет)."""
+        h = box.size
+        Q = box.mask(self.img.shape)
+        region = cv2.dilate(Q, _ell(h * 0.25))
+        plate_lab = self.lab_of(st.plate_color)
+        far_from_plate = (np.linalg.norm(self.lab - plate_lab, axis=2) > 35).astype(np.uint8) * 255
+        hsv_sat = cv2.cvtColor(self.img, cv2.COLOR_RGB2HSV)[..., 1]
+        cand = region & far_from_plate & ~self.white & ((hsv_sat > 80).astype(np.uint8) * 255)
+        tl, tr, br, bl = box.quad
+        u = (tr - tl) / max(1e-6, np.linalg.norm(tr - tl))
+        comps = []
+        for rgb, *_ in self._clusters(cand > 0, k=6, merge_de=20, min_share=0.05):
+            same = (np.linalg.norm(self.lab - self.lab_of(rgb), axis=2) < 24).astype(np.uint8) * 255
+            same = cv2.morphologyEx(same & cand, cv2.MORPH_CLOSE, _ell(max(1, h * 0.05)))
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(same)
+            comps += [((lab == i).astype(np.uint8) * 255, stats[i]) for i in range(1, n)]
+        for comp, (x, y, w, hh, area) in comps:
+            if area < 0.2 * h * h or hh < 0.55 * h or w > 1.6 * h:
+                continue
+            filled = _fill_holes(comp)
+            hull = cv2.convexHull(np.argwhere(filled > 0)[:, ::-1].astype(np.int32))
+            if (filled > 0).sum() < 0.65 * cv2.contourArea(hull):
+                continue  # тонкие штрихи — это буква, а не лепесток
+            holes = filled & ~comp
+            if (self.white[holes > 0] > 0).sum() < 0.05 * area:
+                continue  # внутри нет белой буквы
+            ys, xs = np.nonzero(comp)
+            t = (np.stack([xs, ys], 1) - tl) @ u
+            run = np.linalg.norm(tr - tl)
+            if t.min() > 0.45 * run:          # лепесток справа
+                cut = t.min() - h * 0.05
+                plate_q = np.array([tl, tl + u * cut, bl + u * cut, bl])
+            elif t.max() < 0.55 * run:        # лепесток слева
+                cut = t.max() + h * 0.05
+                plate_q = np.array([tl + u * cut, tr, br, bl + u * cut])
+            else:
+                continue
+            badge_q = np.array([[x, y], [x + w, y], [x + w, y + hh], [x, y + hh]], np.float32)
+            color = tuple(int(v) for v in np.median(self.img[comp > 0], 0))
+            return (TextBox(plate_q.astype(np.float32), box.text, box.score),
+                    TextBox(badge_q, box.text[-1:] or "の", box.score), color)
+        return None
+
+    def _sticker_letters(self, box, Q):
+        h = box.size
+        region = cv2.dilate(Q, _ell(max(2, h * 0.06)))
+        cand = self.colored & region & ~self.white
+        n, lab, st, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+        Qs = Q > 0
+        letters = np.zeros_like(Q)
+        min_area = max(8, h * h * 0.002)
+        for i in range(1, n):
+            if st[i, cv2.CC_STAT_AREA] < min_area:
+                continue
+            x, y, w, hh = st[i, :4]
+            pad = 3
+            sub = (lab[max(0, y - pad):y + hh + pad, max(0, x - pad):x + w + pad] == i).astype(np.uint8) * 255
+            ring = cv2.dilate(sub, _ell(2)) & ~sub
+            wsub = self.white[max(0, y - pad):y + hh + pad, max(0, x - pad):x + w + pad]
+            qsub = Qs[max(0, y - pad):y + hh + pad, max(0, x - pad):x + w + pad]
+            inside = qsub[sub > 0].mean()
+            if ring.any() and inside > 0.5 and (wsub[ring > 0] > 0).mean() > 0.7:
+                letters[max(0, y - pad):y + hh + pad, max(0, x - pad):x + w + pad] |= sub
+        return letters
+
+    def _sticker_style(self, box, Q, letters):
+        h = box.size
+        d = max(3, int(h * 0.1))
+        stick = letters | (self.white & cv2.dilate(letters, _ell(d)))
+        stick = cv2.morphologyEx(stick, cv2.MORPH_CLOSE, _ell(2))
+        stick = _fill_holes(stick, max_area=0.08 * h * h * max(1.0, box.run / h))
+        # толщина белой обводки
+        dist = cv2.distanceTransform((letters == 0).astype(np.uint8), cv2.DIST_L2, 3)
+        edge = stick & ~cv2.erode(stick, _ell(1)) & ~cv2.dilate(letters, _ell(1))
+        ow = float(np.median(dist[edge > 0])) if (edge > 0).any() else h * 0.06
+        colors = self._ordered_colors(cv2.erode(letters, _ell(1)) > 0, box, k=8)
+        return BoxStyle("sticker", colors or [(240, 90, 140)], (255, 255, 255),
+                        float(np.clip(ow / h, 0.035, 0.14)), mask=stick)
+
+    def _plain_style(self, box, Q):
+        h = box.size
+        inner = cv2.erode(Q, _ell(1)) > 0
+        outer = (cv2.dilate(Q, _ell(h * 0.35)) & ~Q) > 0
+        cl = self._clusters(inner, k=5, merge_de=20, min_share=0.03)
+        best, best_score = None, 0.0
+        for rgb, share, *_ in cl:
+            lab = self.lab_of(rgb)
+            near_out = (np.linalg.norm(self.lab[outer] - lab, axis=1) < 18).mean() if outer.any() else 0
+            score = share / (near_out + 0.03)
+            if score > best_score:
+                best, best_score = rgb, score
+        fill = best or (255, 255, 255)
+        lum = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
+        outline = (25, 20, 30) if lum > 150 else (255, 255, 255)
+        mask = cv2.dilate(Q, _ell(h * 0.14))
+        return BoxStyle("plain", [fill], outline, 0.06, mask=mask)
+
+    def lab_of(self, rgb) -> np.ndarray:
+        return cv2.cvtColor(np.uint8([[rgb]]), cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
+
+
+def _fill_holes(m: np.ndarray, max_area: float | None = None) -> np.ndarray:
+    inv = (m == 0).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    out = m.copy()
+    H, W = m.shape
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if x == 0 or y == 0 or x + w >= W or y + h >= H:
+            continue
+        if max_area is None or a <= max_area:
+            out[lab == i] = 255
+    return out
+
+
+@dataclass
+class LogoAnalysis:
+    styles: dict[int, BoxStyle]      # id(box) -> стиль
+    mask: np.ndarray                 # что стереть
+
+
+def analyze_logo(img: np.ndarray, cluster: Cluster, extra: list[TextBox] = ()) -> LogoAnalysis:
+    an = Analyzer(img)
+
+    def excl_for(b):
+        # мелкие подписи поверх крупной строки разбираем отдельно
+        excl = np.zeros(img.shape[:2], np.uint8)
+        for o in cluster.boxes:
+            if o is not b and o.size < 0.6 * b.size:
+                excl |= cv2.dilate(o.mask(img.shape), _ell(o.size * 0.35))
+        return excl
+
+    styles = {}
+    for b in list(cluster.boxes):
+        st = an.analyze_box(b, excl_for(b))
+        styles[id(b)] = st
+        if st.kind == "plate":
+            # OCR мог склеить табличку и лепесток («さくら荘» + «の») — разделяем
+            split = an.split_badge(b, st)
+            if split:
+                plate_box, badge_box, _ = split
+                i = cluster.boxes.index(b)
+                cluster.boxes[i:i + 1] = [plate_box, badge_box]
+                del styles[id(b)]
+                styles[id(plate_box)] = an.analyze_box(plate_box, excl_for(plate_box))
+                styles[id(badge_box)] = an.analyze_box(badge_box, excl_for(badge_box))
+                if styles[id(badge_box)].kind not in ("badge", "plate"):
+                    styles[id(badge_box)] = BoxStyle("badge", [(255, 255, 255)], None, 0.0, split[2], None,
+                                                     True, styles[id(badge_box)].mask)
+                styles[id(badge_box)].kind = "badge"
+                styles[id(badge_box)].glyph_colors = [(255, 255, 255)]
+    cluster.rows = _rows(cluster.boxes)
+    mask = np.zeros(img.shape[:2], np.uint8)
+    for st in styles.values():
+        mask |= st.mask
+    for b in extra:
+        mask |= cv2.dilate(b.mask(img.shape), _ell(b.size * 0.15))
+    # сглаживание + место под тень
+    size = cluster.size
+    mask = cv2.dilate(mask, _ell(max(2, size * 0.02)))
+    shift = max(1, int(size * 0.025))
+    shadow = np.roll(np.roll(mask, shift, 0), shift, 1)
+    mask |= shadow & cv2.dilate(mask, _ell(shift * 2))
+    return LogoAnalysis(styles, mask)
+
+
+def text_removal_mask(img_shape, boxes: list[TextBox]) -> np.ndarray:
+    m = np.zeros(img_shape[:2], np.uint8)
+    for b in boxes:
+        m |= cv2.dilate(b.mask(img_shape), _ell(max(2, b.size * 0.18)))
+    return m
