@@ -82,3 +82,14 @@ def test_latin_logo_is_replaced_end_to_end():
     top = np.asarray(out)[: out.height // 4]
     yellow = (top[..., 0] > 200) & (top[..., 1] > 160) & (top[..., 2] < 90)
     assert yellow.mean() > 0.01                                # русское название тем же жёлтым
+
+
+def test_short_logo_matches_main_part_of_long_title():
+    rz = SimpleNamespace(name="Re:Zero kara Hajimeru Isekai Seikatsu", english="Re:ZERO -Starting Life in Another World-",
+                         japanese="Re:ゼロから始める異世界生活", synonyms=[], russian="Re:Zero. Жизнь с нуля")
+    assert title_match("RE:ZERO", title_variants(rz))[0] > 0.9
+    gd = SimpleNamespace(name="Kidou Senshi Gundam: Suisei no Majo", english="Mobile Suit Gundam: The Witch from Mercury",
+                         japanese="機動戦士ガンダム 水星の魔女", synonyms=[], russian="x")
+    assert title_match("GUNDAM", title_variants(gd))[0] > 0.9
+    assert title_match("COMING SOON", title_variants(rz))[0] < 0.6            # посторонняя надпись
+    assert title_match("TV ANIMATION", title_variants(gd))[0] < 0.6

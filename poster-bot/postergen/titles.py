@@ -152,26 +152,38 @@ def title_variants(info) -> list[str]:
     return out
 
 
+_SEGMENT_SPLIT = re.compile(r"\s+[-–—~〜]\s*|\s*[-–—~〜]\s+|[:：]\s+|\s*[(（\[【「『]|[)）\]】」』]\s*")
+
+
+def title_segments(title: str) -> list[str]:
+    """Части длинного названия: на логотипе часто только главная часть
+    («Re:ZERO -Starting Life in Another World-» → «Re:ZERO», «Mobile Suit Gundam: The Witch…» → «Mobile Suit Gundam»)."""
+    parts = [p.strip(" -–—~〜") for p in _SEGMENT_SPLIT.split(title or "")]
+    return [p for p in parts if len(norm_title(p)) >= 4 and p != title]
+
+
 def title_match(text: str, variants: list[str]) -> tuple[float, str | None]:
     """Насколько текст с постера похож на одно из названий (0..1) и на какое.
-    Учитывает и части: «HUNTER» — это кусок «Hunter x Hunter»."""
+    Учитывает и части: «HUNTER» — это кусок «Hunter x Hunter», «RE:ZERO» — главная часть
+    «Re:ZERO -Starting Life in Another World-»."""
     t = norm_title(text)
     if len(t) < 3:
         return 0.0, None
+    # у латиницы совпавшие куски — от 3 букв подряд (иначе «THE» совпадёт с чем угодно),
+    # у иероглифов и каны — от одного знака
+    min_block = 1 if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", t) else 3
     best, which = 0.0, None
     for v in variants:
-        nv = norm_title(v)
-        if not nv:
-            continue
-        sm = SequenceMatcher(None, t, nv, autojunk=False)
-        # совпавшие куски: у латиницы — от 3 букв подряд (иначе «THE» совпадёт с чем угодно),
-        # у иероглифов и каны — от одного знака
-        min_block = 1 if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", t) else 3
-        matched = sum(b.size for b in sm.get_matching_blocks() if b.size >= min_block)
-        partial = matched / len(t) * min(1.0, len(t) / (0.35 * len(nv)))
-        score = max(sm.ratio(), partial)
-        if score > best:
-            best, which = score, v
+        for part in [v, *title_segments(v)]:
+            nv = norm_title(part)
+            if not nv:
+                continue
+            sm = SequenceMatcher(None, t, nv, autojunk=False)
+            matched = sum(b.size for b in sm.get_matching_blocks() if b.size >= min_block)
+            partial = matched / len(t) * min(1.0, len(t) / (0.35 * len(nv)))
+            score = max(sm.ratio(), partial)
+            if score > best:
+                best, which = score, v
     return best, which
 
 
