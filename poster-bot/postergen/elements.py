@@ -4,8 +4,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .typo import (SS, Element, Layer, Shaped, blur, dilate, finish, font_for_cap, grunge,
-                   per_glyph_fill, rounded_rect_alpha, shape_text, shift, spread_colors)
+from .typo import (SS, Element, Layer, Shaped, _blit_max, blur, dilate, finish, font_for_cap, grunge,
+                   measure, per_glyph_fill, rounded_rect_alpha, shape_text, shift, spread_colors)
 
 SHADOW = (30, 22, 40)
 
@@ -27,14 +27,29 @@ def _pad(layer_or_alpha, p):
 
 def sticker_text(text: str, font: str, weight: int, cap: float, colors, outline_px: float,
                  outline_color=(255, 255, 255), shadow: bool = True, jitter=None, cases=None,
-                 faux_bold: float = 0.0, tracking: float = 0.0) -> Element:
-    """Цветные буквы в толстой общей обводке с мягкой тенью (как «СаКуРАсо»)."""
+                 faux_bold: float = 0.0, tracking: float = 0.0, char_colors=None,
+                 drop_ratio: float = 0.0) -> Element:
+    """Цветные буквы в общей обводке с мягкой тенью (как «СаКуРАсо»).
+
+    char_colors — свой цвет для каждой буквы (например, красный предлог);
+    drop_ratio — во сколько раз первая буква крупнее остальных (буквица).
+    """
     f = font_for_cap(font, cap * SS, weight)
-    sh = shape_text(text, f, tracking=tracking, jitter=jitter, cases=cases, faux_bold=faux_bold)
-    glyphs, fa = _glyph_layer(sh, colors)
+    drop_font = font_for_cap(font, cap * SS * drop_ratio, weight) if drop_ratio > 1 else None
+    sh = shape_text(text, f, tracking=tracking, jitter=jitter, cases=cases, faux_bold=faux_bold,
+                    drop_font=drop_font)
+    if char_colors:
+        rgb, fa = per_glyph_fill(sh, list(char_colors))
+        glyphs = Layer(sh.w, sh.h)
+        glyphs.rgb, glyphs.a = rgb, fa
+    else:
+        glyphs, fa = _glyph_layer(sh, colors)
+    line_a = sh.line_alpha() if sh.drop else None
     ow = outline_px * SS
     p = int(ow * 2 + cap * SS * 0.25) + 4
     glyphs, fa = _pad(glyphs, p), _pad(fa, p)
+    if line_a is not None:
+        line_a = _pad(line_a, p)
     out = Layer(fa.shape[1], fa.shape[0])
     ring = dilate(fa, ow) if ow > 0 else fa
     if shadow:
@@ -43,7 +58,7 @@ def sticker_text(text: str, font: str, weight: int, cap: float, colors, outline_
     if ow > 0 and outline_color:
         out.over(outline_color, ring)
     out.over_layer(glyphs)
-    return finish(out, fa)
+    return finish(out, fa, line_a)
 
 
 def plate_text(text: str, font: str, weight: int, cap: float, glyph_colors, plate_color,
@@ -198,3 +213,95 @@ def distressed_title(lines: list[list[str]], font: str, weight: int, cap: float,
         fa[y:y + a.shape[0], x:x + a.shape[1]] = a
         y += a.shape[0] + gap
     return _finish_single(fa, cap, fill, None, 0, 0.5, halo, distress, seed)
+
+
+def _ink_x(sh: Shaped) -> tuple[float, float]:
+    """Левый и правый край закрашенных букв в координатах строки."""
+    left, right = 1e9, -1e9
+    for p, x, y, _ in sh.patches:
+        cols = np.nonzero(p.max(0) > 20)[0]
+        if len(cols):
+            left, right = min(left, x + cols[0]), max(right, x + cols[-1] + 1)
+    return (left, right) if right > left else (0.0, 0.0)
+
+
+def _paint(layer: Layer, sh: Shaped, colors: list, dx: float, dy: float):
+    """Рисует разложенную строку на холсте со сдвигом; colors — цвет каждой буквы."""
+    H, W = layer.a.shape
+    for p, x, y, idx in sh.patches:
+        a = np.zeros((H, W), np.float32)
+        _blit_max(a, p.astype(np.float32) / 255, int(round(x + dx)), int(round(y + dy)))
+        layer.over(colors[idx], a)
+
+
+def dropcap_title(text: str, subtitle: str | None, font: str, weight: int | None, cap: float,
+                  sub_cap: float, fill=(255, 255, 255), accent=None, drop_n: int = 0,
+                  accent_flags: list[bool] | None = None, tracking: float = 0.03,
+                  shadow_opacity: float = 0.5) -> Element:
+    """Заглавные с засечками в духе «ВОСХОЖДЕНИЕ В ТЕНИ»: крупная буквица слева (как огромный «陰»),
+    справа строка названия, под ней английское название вразрядку до той же ширины.
+    accent_flags — какие буквы красить цветом-акцентом (как красные «の», «に»)."""
+    text = text.upper()
+    flags = accent_flags or [False] * len(text)
+    colors = [accent if (f and accent) else fill for f in flags]
+    rest = text[drop_n:]
+    start = drop_n + len(rest) - len(rest.lstrip())
+    drop, main = text[:drop_n], text[start:]
+    c = cap * SS
+    gap = 0.45 * c
+    sh_m = shape_text(main, font_for_cap(font, c, weight), tracking=tracking)
+    ml, mr = _ink_x(sh_m)
+    main_w = mr - ml
+
+    sh_s = None
+    s = sub_cap * SS
+    if subtitle:
+        fs = font_for_cap(font, s, weight)
+        natural = measure(subtitle, fs, 0.04)
+        if natural > main_w:                       # не шире строки названия
+            s *= main_w / natural
+            fs = font_for_cap(font, s, weight)
+        w0 = measure(subtitle, fs)
+        n = max(1, len(subtitle) - 1)
+        t = float(np.clip((main_w * 0.97 - w0) / (fs.size * n), 0.03, 0.35))
+        sh_s = shape_text(subtitle, fs, tracking=t)
+
+    pad = int(1.2 * c + 0.6 * s)
+    top = pad
+    x_main = pad
+    drop_base = None
+    sh_d = None
+    if drop:
+        D = (c + gap + s) if sh_s else 1.75 * c       # буквица — от верха названия до низа подписи
+        sh_d = shape_text(drop, font_for_cap(font, D, weight), tracking=-0.01)
+        dl, dr = _ink_x(sh_d)
+        dx_d, dy_d = pad - dl, top - (sh_d.baseline - sh_d.cap)
+        x_main = dr + dx_d + 0.14 * c
+        drop_base = top + sh_d.cap
+    dx_m = x_main - ml
+    if drop and not sh_s:
+        dy_m = drop_base - sh_m.baseline           # строка стоит на одной линии с буквицей
+    else:
+        dy_m = top - (sh_m.baseline - sh_m.cap)
+    right = mr + dx_m
+    bottom = dy_m + sh_m.baseline + sh_m.cap * 0.3
+    if sh_s:
+        sl, sr = _ink_x(sh_s)
+        dx_s = x_main - sl
+        dy_s = (top + sh_m.cap + gap + sh_s.cap) - sh_s.baseline
+        right = max(right, sr + dx_s)
+        bottom = max(bottom, dy_s + sh_s.baseline + sh_s.cap * 0.3)
+    if drop_base is not None:
+        bottom = max(bottom, drop_base + 0.3 * sh_d.cap)
+    W, H = int(right + pad), int(bottom + pad)
+
+    glyphs = Layer(W, H)
+    if sh_d is not None:
+        _paint(glyphs, sh_d, colors[:drop_n], dx_d, dy_d)
+    _paint(glyphs, sh_m, colors[start:], dx_m, dy_m)
+    if sh_s is not None:
+        _paint(glyphs, sh_s, [fill] * len(subtitle), dx_s, dy_s)
+    out = Layer(W, H)
+    out.over(SHADOW, blur(shift(glyphs.a, c * 0.03, c * 0.05), c * 0.06 + 1), shadow_opacity)
+    out.over_layer(glyphs)
+    return finish(out, glyphs.a)

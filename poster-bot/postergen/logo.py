@@ -24,6 +24,9 @@ class BoxStyle:
     plate_border: tuple[int, int, int] | None = None
     shadow: bool = True
     mask: np.ndarray | None = field(default=None, repr=False)
+    accent: tuple[int, int, int] | None = None  # второй цвет (красные «の», «に») — для предлогов
+    thin: bool = False                          # тонкие штрихи (шрифт с засечками, «минтё»)
+    strokes: np.ndarray | None = field(default=None, repr=False)  # сами штрихи без запаса
 
 
 class Analyzer:
@@ -129,7 +132,9 @@ class Analyzer:
                 near = lambda sel: (np.linalg.norm(self.lab[sel] - ref, axis=1) < 32).mean() if sel.any() else 0.0
                 in_share = near(band > 0)
                 far = (cv2.dilate(Q, _ell(h * 1.0)) & ~cv2.dilate(Q, _ell(h * 0.5))) > 0
-                if in_share > 0.35 and near(far) < 0.3:
+                # у таблички есть край: сразу за ней её цвета уже нет (иначе это просто фон)
+                mid = (cv2.dilate(Q, _ell(h * 0.5)) & ~cv2.dilate(Q, _ell(h * 0.25))) > 0
+                if in_share > 0.35 and near(mid) < 0.15 and near(far) < 0.3:
                     plate = rgb
         if plate is not None:
             return self._plate_style(box, Q, plate)
@@ -254,25 +259,154 @@ class Analyzer:
                         float(np.clip(ow / h, 0.035, 0.14)), mask=stick)
 
     def _plain_style(self, box, Q):
+        """Обычные буквы: цвет букв, обводка, цвет-акцент, тонкие ли штрихи.
+
+        Цвета текста — те, что в середине строки встречаются заметно чаще, чем снаружи рамки
+        (фон одинаков везде). Из них обводка — та, что окружает другую; акцент — отдельный
+        яркий цвет (красные «の», «に»).
+        """
         h = box.size
-        inner = cv2.erode(Q, _ell(1)) > 0
-        outer = (cv2.dilate(Q, _ell(h * 0.35)) & ~Q) > 0
-        cl = self._clusters(inner, k=5, merge_de=20, min_share=0.03)
-        best, best_score = None, 0.0
-        for rgb, share, *_ in cl:
-            lab = self.lab_of(rgb)
-            near_out = (np.linalg.norm(self.lab[outer] - lab, axis=1) < 18).mean() if outer.any() else 0
-            score = share / (near_out + 0.03)
-            if score > best_score:
-                best, best_score = rgb, score
-        fill = best or (255, 255, 255)
-        lum = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
-        outline = (25, 20, 30) if lum > 150 else (255, 255, 255)
-        mask = cv2.dilate(Q, _ell(h * 0.14))
-        return BoxStyle("plain", [fill], outline, 0.06, mask=mask)
+        mid_q = np.zeros_like(Q)
+        cv2.fillPoly(mid_q, [np.round(_band(box.quad, 0.3, 0.7, box.vertical)).astype(np.int32)], 255)
+        mid = (mid_q & Q) > 0
+        edge = (cv2.dilate(Q, _ell(h * 0.3)) & ~Q) > 0
+        Qd = cv2.dilate(Q, _ell(max(2, h * 0.12)))
+        cands = []
+        for rgb, *_ in self._clusters(Q > 0, k=6, merge_de=20, min_share=0.01):
+            m = np.linalg.norm(self.lab - self.lab_of(rgb), axis=2) < 22
+            c_mid = float(m[mid].mean()) if mid.any() else 0.0
+            c_edge = float(m[edge].mean()) if edge.any() else 0.0
+            ratio = c_mid / (c_edge + 0.02)
+            cands.append((ratio * np.sqrt(c_mid), ratio, c_mid, rgb, self._strokes(m, Qd, mid, edge), m))
+        cands.sort(key=lambda c: -c[0])
+        text = [c for c in cands if c[1] > 1.3 and c[2] >= 0.01] or cands[:1]
+        if not text:
+            return BoxStyle("plain", [(255, 255, 255)], (25, 20, 30), 0.06, mask=cv2.dilate(Q, _ell(h * 0.14)))
+
+        r = max(2, int(h * 0.04))
+
+        def surround(a, b):     # какая доля кольца вокруг a занята b
+            ring = cv2.dilate(a, _ell(r)) & ~a
+            return (ring & b).sum() / max(1, ring.sum())
+
+        fill_c, outline_c = text[0], None
+        if len(text) > 1:
+            other = text[1]
+            s_fo, s_of = surround(fill_c[4], other[4]), surround(other[4], fill_c[4])
+            if max(s_fo, s_of) > 0.45:
+                if s_of > s_fo:          # «другой» цвет внутри — значит это буквы, а наш — обводка
+                    fill_c, outline_c = other, fill_c
+                else:
+                    outline_c = other
+        fill = fill_c[3]
+        fill_lab = self.lab_of(fill)
+        accent = None
+        for c in text:
+            if c is fill_c or c is outline_c:
+                continue
+            rgb = c[3]
+            if max(rgb) - min(rgb) > 80 and np.linalg.norm(self.lab_of(rgb) - fill_lab) > 40 \
+                    and surround(c[4], fill_c[4]) < 0.3:
+                accent = rgb
+                break
+        # толщина штрихов относительно высоты строки
+        thin = False
+        fm = fill_c[4] & Q
+        if (fm > 0).sum() > 50:
+            d = cv2.distanceTransform((fm > 0).astype(np.uint8), cv2.DIST_L2, 3)
+            ridge = (d >= cv2.dilate(d, np.ones((3, 3), np.uint8))) & (d > 0.9)
+            if ridge.any():
+                thin = 2 * float(d[ridge].mean()) / h < 0.05
+        outline = outline_c[3] if outline_c else None
+        # стираем только сами буквы (с запасом на сглаживание и тень), а не всю рамку —
+        # так не задеваем фон и соседние надписи вроде английского названия
+        # Что стирать: сами буквы. Строгий цвет — чтобы не прилипал похожий фон (подсвеченная
+        # стена), затем куски того же цвета, связанные с буквами (кончики штрихов за рамкой OCR),
+        # и мягкий край с запасом по цвету (сглаживание, подсветка).
+        strict = np.zeros(Q.shape, bool)
+        loose = np.zeros(Q.shape, bool)
+        for c in text:
+            if c is fill_c or c is outline_c or (accent is not None and c[3] == accent):
+                d = np.linalg.norm(self.lab - self.lab_of(c[3]), axis=2)
+                strict |= d < 24
+                loose |= d < 40
+        strokes = self._strokes(strict, Qd, None, edge)
+        strokes |= self._thin_strokes(fill, Q, strokes, edge, h)
+        if strokes.any():
+            near = cv2.dilate(Q, _ell(h * 0.35)) > 0
+            n, lab = cv2.connectedComponents((strict & near).astype(np.uint8), connectivity=8)
+            ids = np.unique(lab[(strokes > 0) & (lab > 0)])
+            if len(ids):
+                strokes |= np.isin(lab, ids).astype(np.uint8) * 255
+            strokes |= (loose & (cv2.dilate(strokes, _ell(max(2, h * 0.05))) > 0)).astype(np.uint8) * 255
+        if (strokes > 0).sum() > 0.02 * (Q > 0).sum():
+            mask = cv2.dilate(strokes, _ell(max(3, h * 0.08)))
+        else:
+            strokes = None
+            mask = cv2.dilate(Q, _ell(h * 0.14))
+        return BoxStyle("plain", [fill], outline, 0.06 if outline else 0.0, mask=mask, accent=accent, thin=thin,
+                        strokes=strokes)
+
+    def _thin_strokes(self, fill, Q, core, edge, h) -> np.ndarray:
+        """Тонкие линии светлее (или темнее) своего окружения — штрихи букв. Морфологический
+        «top-hat» не реагирует на большие светлые области (подсвеченная стена, небо).
+        Берём только то, что лежит в пределах уже найденных букв (их выпуклой оболочки)."""
+        if not core.any():
+            return np.zeros_like(Q)
+        n_c, lab_c, st_c, _ = cv2.connectedComponentsWithStats((core > 0).astype(np.uint8))
+        hull_m = np.zeros_like(Q)
+        pts = np.argwhere(core > 0)[:, ::-1].astype(np.int32)
+        cv2.fillPoly(hull_m, [cv2.convexHull(pts)], 255)
+        hull_m = cv2.dilate(hull_m, _ell(max(2, h * 0.08))) & cv2.dilate(Q, _ell(max(2, h * 0.08)))
+        L = self.lab[..., 0]
+        fill_L = float(self.lab_of(fill)[0])
+        bg_L = float(np.median(L[edge > 0])) if (edge > 0).any() else 128.0
+        k = _ell(max(4, h * 0.08))
+        if fill_L > bg_L + 40:
+            th = cv2.morphologyEx(L, cv2.MORPH_TOPHAT, k)
+        elif fill_L < bg_L - 40:
+            th = cv2.morphologyEx(L, cv2.MORPH_BLACKHAT, k)
+        else:
+            return np.zeros_like(Q)
+        near_fill = np.linalg.norm(self.lab - self.lab_of(fill), axis=2) < 50
+        cand = ((th > 28) & near_fill & (cv2.dilate(Q, _ell(h * 0.35)) > 0)).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+        out = np.zeros_like(Q)
+        inside = hull_m > 0
+        for i in range(1, n):
+            x, y, w, hh, area = st[i]
+            sub = lab[y:y + hh, x:x + w] == i
+            if area >= 6 and inside[y:y + hh, x:x + w][sub].mean() >= 0.6:
+                out[y:y + hh, x:x + w][sub] = 255
+        return out
+
+    @staticmethod
+    def _strokes(m: np.ndarray, Qd: np.ndarray, mid: np.ndarray, edge: np.ndarray) -> np.ndarray:
+        """Только пятна цвета, похожие на буквы: проходят через середину строки и не уходят за рамку
+        (так белое небо за белыми буквами не путается с самими буквами)."""
+        mm = (m & (Qd > 0)).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(mm, connectivity=8)
+        keep = np.zeros(mm.shape, np.uint8)
+        for i in range(1, n):
+            x, y, w, h, area = st[i]
+            sub = lab[y:y + h, x:x + w] == i
+            if mid is not None and not mid[y:y + h, x:x + w][sub].any():
+                continue
+            if edge[y:y + h, x:x + w][sub].sum() > 0.3 * area:
+                continue
+            keep[y:y + h, x:x + w][sub] = 255
+        return keep
 
     def lab_of(self, rgb) -> np.ndarray:
         return cv2.cvtColor(np.uint8([[rgb]]), cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
+
+
+def _band(q, a: float, b: float, vertical: bool) -> np.ndarray:
+    """Полоса внутри рамки текста: от a до b поперёк строки (0..1)."""
+    tl, tr, br, bl = q
+    if vertical:
+        return np.array([tl + a * (tr - tl), tl + b * (tr - tl), bl + b * (br - bl), bl + a * (br - bl)])
+    return np.array([tl + a * (bl - tl), tr + a * (br - tr), tr + b * (br - tr), tl + b * (bl - tl)])
 
 
 def _fill_holes(m: np.ndarray, max_area: float | None = None) -> np.ndarray:
@@ -296,6 +430,7 @@ class LogoAnalysis:
 
 
 def analyze_logo(img: np.ndarray, cluster: Cluster, extra: list[TextBox] = ()) -> LogoAnalysis:
+    """extra — надписи рядом с логотипом (английское название), их стираем вместе с ним."""
     an = Analyzer(img)
 
     def excl_for(b):
@@ -330,7 +465,22 @@ def analyze_logo(img: np.ndarray, cluster: Cluster, extra: list[TextBox] = ()) -
     for st in styles.values():
         mask |= st.mask
     for b in extra:
-        mask |= cv2.dilate(b.mask(img.shape), _ell(b.size * 0.15))
+        mask |= an.analyze_box(b).mask
+    # добираем куски букв, попавшие между рамками соседних частей логотипа
+    plain_colors = [c for st in styles.values() if st.kind == "plain"
+                    for c in st.glyph_colors[:1] + ([st.accent] if st.accent else [])]
+    if plain_colors:
+        area = np.zeros_like(mask)
+        for b in list(cluster.boxes) + list(extra):
+            area |= cv2.dilate(b.mask(img.shape), _ell(max(2, b.size * 0.08)))
+        strict = np.zeros(mask.shape, bool)
+        for c in plain_colors:
+            strict |= np.linalg.norm(an.lab - an.lab_of(c), axis=2) < 26
+        rest = (strict & (area > 0) & (mask == 0)).astype(np.uint8)
+        n, lab, st_, _ = cv2.connectedComponentsWithStats(rest, connectivity=8)
+        for i in range(1, n):
+            if st_[i, cv2.CC_STAT_AREA] >= 4:
+                mask |= cv2.dilate((lab == i).astype(np.uint8) * 255, _ell(max(3, cluster.size * 0.04)))
     # сглаживание + место под тень
     size = cluster.size
     mask = cv2.dilate(mask, _ell(max(2, size * 0.02)))

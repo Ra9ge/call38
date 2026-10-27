@@ -1,15 +1,18 @@
 """Весь процесс: постер -> поиск японского текста -> стирание -> русское название."""
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 
-from .compose import add_badge, add_watermark, badge_reserve, detect_faces, render_overlay, render_replacement
+from .compose import (add_badge, add_watermark, badge_reserve, detect_faces, render_overlay, render_replacement,
+                      watermark_rect)
 from .detect import detect_text, find_title
 from .inpaint import inpaint
 from .logo import analyze_logo, text_removal_mask
@@ -61,6 +64,36 @@ def _prepare(img: Image.Image, min_width: int) -> Image.Image:
     return img
 
 
+def find_logo_subtitle(boxes, cluster) -> list:
+    """Латинская строка прямо у японского логотипа (английское название, как «The Eminence in shadow»)."""
+    x0, y0, x1, y1 = cluster.bbox
+    size = cluster.size
+    out = []
+    for b in boxes:
+        if b.cjk or b.score < 0.6 or sum(ch.isalpha() for ch in b.text) < 4:
+            continue
+        if b.x1 < x0 - 0.3 * size or b.x0 > x1 + 0.3 * size:
+            continue
+        if b.y0 > y1 + 0.6 * size or b.y1 < y0 - 0.6 * size:
+            continue
+        out.append(b)
+    return out
+
+
+def subtitle_text(ocr: str, info) -> str:
+    """Текст распознанной английской строки; если OCR ошибся — берём название с Shikimori."""
+    norm = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())
+    for cand in (getattr(info, "english", None), getattr(info, "name", None)):
+        if not cand:
+            continue
+        r = SequenceMatcher(None, norm(ocr), norm(cand)).ratio()
+        if r >= 0.9:
+            return ocr          # совпало — оставляем как на постере (регистр букв и т.п.)
+        if r >= 0.7:
+            return cand
+    return ocr
+
+
 def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple[Image.Image, Report]:
     opts = opts or Options()
     rep = Report()
@@ -89,8 +122,15 @@ def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple
 
     mask = np.zeros(arr.shape[:2], np.uint8)
     la = None
+    logo_sub, logo_sub_size = None, None
     if mode == "replace":
-        la = analyze_logo(arr, cluster)
+        # английская строка у логотипа стирается вместе с ним и набирается заново под русским названием
+        sub_boxes = find_logo_subtitle(boxes, cluster)
+        if sub_boxes:
+            ocr = " ".join(b.text for b in sorted(sub_boxes, key=lambda b: (round(b.cy / 20), b.cx)))
+            logo_sub = subtitle_text(ocr, info) if opts.subtitle is None else (opts.subtitle or None)
+            logo_sub_size = max(b.size for b in sub_boxes)
+        la = analyze_logo(arr, cluster, extra=sub_boxes)
         mask |= la.mask
         for b in cluster.boxes:
             st = la.styles[id(b)]
@@ -107,24 +147,30 @@ def make_poster(info, poster: Image.Image, opts: Options | None = None) -> tuple
         clean = arr
 
     out = Image.fromarray(clean).convert("RGBA")
+    # где встанет лого — название его обходит
+    logo_rect = watermark_rect(out.size, Path(opts.logo), corner=opts.logo_corner) if opts.logo else None
     badge_gap, badge_cap = 0.8, None
     if mode == "replace":
         log("Рисую русское название в стиле оригинала...")
         badge_gap = -0.3   # плашка чуть заходит на тень/обводку названия
         reserve = badge_reserve(out.height, badge_gap) if opts.badge else 0.0
         area, _ = render_replacement(out, cluster, la, title, font=opts.font, playful=opts.playful, seed=seed,
-                                     bottom_reserve=reserve, label=label)
+                                     bottom_reserve=reserve, label=label, subtitle=logo_sub,
+                                     sub_size=logo_sub_size, avoid=logo_rect)
     else:
         log("Добавляю название поверх постера...")
         faces = detect_faces(clean)
-        area, title_cap = render_overlay(out, title, label, subtitle, faces, seed=seed, distress=opts.distress,
+        avoid = [(logo_rect[0], logo_rect[1], logo_rect[2] - logo_rect[0], logo_rect[3] - logo_rect[1])] \
+            if logo_rect else []
+        area, title_cap = render_overlay(out, title, label, subtitle, faces, avoid=avoid, seed=seed,
+                                         distress=opts.distress,
                                          bottom_reserve=badge_reserve(out.height, badge_gap) if opts.badge else 0.0)
         badge_cap = title_cap * 0.7
 
     if opts.badge:
         add_badge(out, opts.badge, area, color=opts.badge_color, gap=badge_gap, cap=badge_cap)
     if opts.logo:
-        add_watermark(out, Path(opts.logo), corner=opts.logo_corner)
+        add_watermark(out, Path(opts.logo), corner=opts.logo_corner, avoid=area)
 
     if opts.debug_dir:
         d = Path(opts.debug_dir)

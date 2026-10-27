@@ -39,3 +39,20 @@ def test_taglines():
     assert tagline_text("第三期", None) == "ТРЕТИЙ СЕЗОН"
     assert tagline_text("劇場版", None) == "ФИЛЬМ"
     assert tagline_text("さくら荘", None) is None
+
+
+def test_accent_letters_like_reference():
+    # как на образце «ВОСХОЖДЕНИЕ В ТЕНИ»: красные «О» в буквице, все «Е» и предлог «В»
+    from postergen.compose import accent_flags
+    text = "ВОСХОЖДЕНИЕ В ТЕНИ"
+    red = "".join(ch for ch, f in zip(text, accent_flags(text, 2)) if f)
+    assert red == "ОЕЕВЕ"
+
+
+def test_subtitle_text_keeps_poster_spelling():
+    from types import SimpleNamespace
+
+    from postergen.pipeline import subtitle_text
+    info = SimpleNamespace(english="The Eminence in Shadow", name="Kage no Jitsuryokusha ni Naritakute!")
+    assert subtitle_text("The Eminence in shadow", info) == "The Eminence in shadow"   # как на постере
+    assert subtitle_text("The Emlnence ln shadou", info) == "The Eminence in Shadow"   # ошибки OCR

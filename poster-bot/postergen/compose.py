@@ -4,6 +4,7 @@ from __future__ import annotations
 import itertools
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -12,7 +13,8 @@ import numpy as np
 from PIL import Image
 
 from .detect import Cluster, Row
-from .elements import distressed_title, outlined_text, petal_text, plate_text, sticker_text
+from .elements import (distressed_title, dropcap_title, outlined_text, petal_text, plate_text,
+                       sticker_text)
 from .logo import BoxStyle, LogoAnalysis
 from .titles import ORDINALS_M
 from .typo import Element, font_for_cap, measure
@@ -34,6 +36,7 @@ class FontChoice:
 CUTE = FontChoice("comfortaa", 700, 0.035)
 BOLD = FontChoice("rubik", 800)
 CLEAN = FontChoice("montserrat", 800)
+SERIF = FontChoice("tinos", 400)           # тонкие логотипы с засечками («минтё»)
 
 
 # ============================================================ замена логотипа
@@ -42,6 +45,7 @@ class Seg:
     kind: str
     style: BoxStyle
     text: str = ""
+    drop: float = 0.0     # буквица: во сколько раз первая буква крупнее
 
 
 def _row_segments(row: Row, styles: dict) -> list[Seg]:
@@ -52,7 +56,8 @@ def _row_segments(row: Row, styles: dict) -> list[Seg]:
             # соседние куски одной строки — один стиль, цвета подряд (копия, оригинал не трогаем)
             prev = segs[-1].style
             colors = prev.glyph_colors + [c for c in st.glyph_colors if c not in prev.glyph_colors]
-            segs[-1] = Seg(st.kind, replace(prev, glyph_colors=colors))
+            segs[-1] = Seg(st.kind, replace(prev, glyph_colors=colors, accent=prev.accent or st.accent,
+                                            thin=prev.thin or st.thin))
             continue
         segs.append(Seg(st.kind, st))
     return segs
@@ -60,19 +65,24 @@ def _row_segments(row: Row, styles: dict) -> list[Seg]:
 
 def choose_font(styles: list[BoxStyle], forced: str | None = None) -> FontChoice:
     if forced:
-        return {"comfortaa": CUTE, "rubik": BOLD, "montserrat": CLEAN}.get(forced, FontChoice(forced, 800))
+        return {"comfortaa": CUTE, "rubik": BOLD, "montserrat": CLEAN, "tinos": SERIF}.get(
+            forced, FontChoice(forced, 800))
     kinds = {s.kind for s in styles}
     multicolor = any(len(s.glyph_colors) >= 2 for s in styles if s.kind in ("sticker", "plate"))
     if kinds & {"plate", "badge"} or ("sticker" in kinds and multicolor):
         return CUTE
     if "sticker" in kinds:
         return BOLD
+    if any(s.thin for s in styles if s.kind == "plain"):
+        return SERIF
     return CLEAN
 
 
 def _seg_width(seg: Seg, text: str, fc: FontChoice, cap: float) -> float:
     f = font_for_cap(fc.name, cap, fc.weight)
     w = measure(text, f) * (1 + fc.faux_bold * 0.5)
+    if seg.drop > 1 and text:
+        w += measure(text[0], f) * (seg.drop - 1)
     if seg.kind == "plate":
         w = measure(text.upper(), f, 0.02) + cap * 1.3
     elif seg.kind == "badge":
@@ -132,6 +142,7 @@ class RowGeom:
     cy: float
     main: bool = False
     tagline: str | None = None
+    drop: float = 0.0    # первый знак логотипа сильно крупнее (огромный «陰») — делаем буквицу
 
     @property
     def cap(self) -> float:
@@ -145,8 +156,14 @@ def row_geoms(rows: list[Row], label: str | None) -> list[RowGeom]:
         if mb.vertical:
             g = RowGeom(r, mb.thick, mb.run, -90.0, mb.cx, mb.cy)
         else:
-            g = RowGeom(r, r.w if abs(r.angle) < 15 else mb.run, r.h, r.angle if abs(r.angle) > 1.5 else 0.0,
-                        r.cx, r.cy)
+            line = max(r.boxes, key=lambda b: b.run)      # высоту строки берём по самой длинной части
+            first = r.boxes[0]
+            drop = 0.0
+            if len(r.boxes) > 1 and first is not line and len(first.text.strip()) == 1 \
+                    and first.size >= 1.4 * line.size:
+                drop = first.size / line.size
+            g = RowGeom(r, r.w if abs(r.angle) < 15 else mb.run, line.size if drop else r.h,
+                        r.angle if abs(r.angle) > 1.5 else 0.0, r.cx, line.cy if drop else r.cy, drop=drop)
         out.append(g)
     main = max(out, key=lambda g: g.thick * math.sqrt(g.length))
     main.main = True
@@ -172,7 +189,8 @@ def fit_row(g: RowGeom, segs: list[Seg], fc: FontChoice, W: int, H: int):
     avail = _avail(g, W, H)
     cap = g.cap
     s1 = avail / max(1.0, sum(_seg_width(s, s.text, fc, cap) for s in segs))
-    if len(segs) == 1 and segs[0].kind in ("sticker", "plain") and len(segs[0].text.split()) >= 2:
+    if len(segs) == 1 and segs[0].kind in ("sticker", "plain") and len(segs[0].text.split()) >= 2 \
+            and not segs[0].drop:
         lines = _wrap2(segs[0].text.split())
         lonely = any(len(ln) == 1 and ln[0].lower().strip(",.:") in SHORT_WORDS for ln in lines)
         w2 = max(_seg_width(segs[0], " ".join(ln), fc, cap) for ln in lines)
@@ -245,9 +263,21 @@ def _render_segment(seg: Seg, text: str, fc: FontChoice, cap: float, playful: bo
         jitter = {"rot": 4.0, "dy": 0.035, "seed": seed}
     elif seg.kind == "sticker":
         text = text.upper()
+    char_colors = _accent_colors(text, st) if st.accent else None
     return sticker_text(text, fc.name, fc.weight, cap, st.glyph_colors, outline_px,
                         st.outline_color, shadow=True, jitter=jitter, cases=cases,
-                        faux_bold=fc.faux_bold)
+                        faux_bold=fc.faux_bold, char_colors=char_colors, drop_ratio=seg.drop)
+
+
+def _accent_colors(text: str, st: BoxStyle) -> list:
+    """Предлоги и союзы — цветом-акцентом, как красные частицы «の», «に» в японском логотипе."""
+    fill = st.glyph_colors[0] if st.glyph_colors else (255, 255, 255)
+    out = []
+    for m in re.finditer(r"\S+|\s+", text):
+        word = m.group()
+        color = st.accent if word.lower().strip(",.:;!?«»\"'") in SHORT_WORDS else fill
+        out += [color] * len(word)
+    return out
 
 
 def _hstack(elements: list[Element], gap: float, overlap_last: float = 0.0) -> Element:
@@ -310,11 +340,18 @@ def _place_label(poster, text: str, near_box, cap: float):
 
 def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, title: str,
                        font: str | None = None, playful: bool = True, seed: int = 0,
-                       bottom_reserve: float = 0.0, label: str | None = None):
-    """Рисует русское название на месте японского. Возвращает занятую область."""
+                       bottom_reserve: float = 0.0, label: str | None = None,
+                       subtitle: str | None = None, sub_size: float | None = None, avoid=None):
+    """Рисует русское название на месте японского. Возвращает занятую область.
+
+    subtitle — английская строка из логотипа (её стёрли вместе с японской и набираем заново
+    под русским названием); avoid — область лого в углу, на которую нельзя налезать.
+    """
     W, H = poster.size
     styles = la.styles
     fc = choose_font(list(styles.values()), font)
+    if fc.name == SERIF.name and len(cluster.rows) == 1 and all(st.kind == "plain" for st in styles.values()):
+        return render_serif_logo(poster, cluster, la, title, fc, subtitle, avoid, bottom_reserve), fc
     geoms = row_geoms(cluster.rows, label)
     groups = split_title_over_rows(title, geoms, styles, fc, W, H)
     cx0, cy0, cx1, cy1 = cluster.bbox
@@ -330,6 +367,8 @@ def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, 
             label_used = label_used or g.tagline == label
         elif words:
             segs = _assign_segments(_row_segments(row, styles), words)
+            if g.drop and len(segs) == 1 and segs[0].kind in ("plain", "sticker"):
+                segs[0].drop = g.drop * 1.15
         else:
             continue
         scale, lines = fit_row(g, segs, fc, W, H)
@@ -401,13 +440,25 @@ def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, 
             elif g.cy >= big[0].cy and by1 - y0 > allowed:
                 p[3] += (by1 - y0) - allowed
 
-    # место под плашку снизу: поднимаем всё название целиком
-    if placed and bottom_reserve > 0:
-        bottom = max(p[1].bbox_at(p[2], p[3])[3] for p in placed)
-        lift = bottom - (H - m - bottom_reserve)
-        if lift > 0:
-            for p in placed:
-                p[3] -= lift
+    # английская строка из логотипа — под главной строкой
+    if subtitle and big:
+        bx0, by0, bx1, by1 = big[1].bbox_at(big[2], big[3])
+        st_main = next((st for st in styles.values() if st.kind == "plain"), None)
+        sub_cap = min(0.6 * sub_size if sub_size else big[0].cap * 0.4, big[0].cap * 0.5)
+        fill = st_main.glyph_colors[0] if st_main else (255, 255, 255)
+        outline = st_main.outline_color if st_main else (30, 25, 40)
+        sub_el = outlined_text(subtitle, fc.name, fc.weight, sub_cap, fill=fill, outline=outline,
+                               outline_px=sub_cap * 0.12 if outline else 0, tracking=0.08)
+        y = by1 + sub_cap * 0.4 + sub_el.h / 2
+        placed.append([RowGeom(big[0].row, sub_el.w, sub_cap / 0.6, 0.0, (bx0 + bx1) / 2, y), sub_el,
+                       (bx0 + bx1) / 2, y])
+
+    # место под плашку снизу и под лого в углу: двигаем всё название целиком
+    if placed:
+        rect = _union([p[1].bbox_at(p[2], p[3]) for p in placed])
+        dy = _fit_vertically(rect, W, H, bottom_reserve, avoid)
+        for p in placed:
+            p[3] += dy
 
     # сначала крупная строка, мелкие (таблички) — поверх, как в оригинале
     boxes = []
@@ -419,6 +470,91 @@ def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, 
         boxes.append(_place_label(poster, label, area, max(big[0].cap * 0.3, 0.014 * H)))
         area = _union(boxes)
     return area, fc
+
+
+def _fit_vertically(rect, W: int, H: int, bottom_reserve: float = 0.0, avoid=None) -> float:
+    """На сколько сдвинуть название по вертикали: не налезать на лого в углу,
+    оставить место под плашку снизу и не вылезать за края."""
+    x0, y0, x1, y1 = rect
+    m = 0.02 * W
+    dy = 0.0
+    if avoid:
+        ax0, ay0, ax1, ay1 = avoid
+        g = 0.015 * W
+        if x1 > ax0 - g and x0 < ax1 + g and y1 > ay0 - g and y0 < ay1 + g:
+            dy = (ay1 + 0.08 * H - y0) if (ay0 + ay1) / 2 < H / 2 else (ay0 - 0.08 * H - y1)
+    if y1 + dy > H - m - bottom_reserve:
+        dy = H - m - bottom_reserve - y1
+    if y0 + dy < m:
+        dy = m - y0
+    return dy
+
+
+VOWELS = "ЕОАИУЯЫЮЭЁ"   # в этом порядке выбираем при равенстве
+
+
+def accent_flags(text: str, drop_n: int) -> list[bool]:
+    """Какие буквы красить акцентом (как красные «の», «に» в японском логотипе):
+    предлоги, вторая буква буквицы и самая частая гласная остальной строки."""
+    flags = [False] * len(text)
+    for m in re.finditer(r"\S+", text):
+        if m.start() >= drop_n and m.group().lower().strip(",.:;!?«»\"'") in SHORT_WORDS:
+            flags[m.start():m.end()] = [True] * (m.end() - m.start())
+    if drop_n >= 2:
+        flags[drop_n - 1] = True
+    rest = [ch for i, ch in enumerate(text.upper()) if i >= drop_n and not flags[i] and ch.isalpha()]
+    counts = Counter(ch for ch in rest if ch in VOWELS)
+    if counts:
+        best = max(VOWELS, key=lambda v: (counts.get(v, 0), -VOWELS.index(v)))
+        if counts[best] >= 2 and counts[best] <= 0.35 * len(rest):
+            for i, ch in enumerate(text.upper()):
+                if i >= drop_n and ch == best:
+                    flags[i] = True
+    return flags
+
+
+def render_serif_logo(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, title: str, fc: FontChoice,
+                      subtitle: str | None = None, avoid=None, bottom_reserve: float = 0.0):
+    """Тонкий логотип с засечками (как «陰の実力者になりたくて!»): заглавные, крупная буквица,
+    акцентные буквы, английская строка вразрядку под названием."""
+    W, H = poster.size
+    boxes = sorted(cluster.boxes, key=lambda b: -b.run)
+    st = la.styles[id(boxes[0])]
+    fill = st.glyph_colors[0] if st.glyph_colors else (255, 255, 255)
+    accent = next((la.styles[id(b)].accent for b in boxes if la.styles[id(b)].accent), None)
+    g = next(g for g in row_geoms(cluster.rows, None) if g.main)
+    text = title.upper()
+    drop_n = 0
+    if g.drop:
+        first = re.sub(r"[^\w]", "", text.split()[0]) if text.split() else ""
+        drop_n = 2 if len(first) >= 5 else 1
+    flags = accent_flags(text, drop_n) if accent else None
+    x0, y0, x1, y1 = cluster.bbox
+    target_w = min(max(x1 - x0, 0.88 * W), 0.92 * W)   # почти во всю ширину, как на образце
+    cap_max = g.cap
+    cap = cap_max
+    for _ in range(4):
+        s_cap = 0.72 * cap          # английская строка — около ¾ высоты русских букв, как на образце
+        el = dropcap_title(text, subtitle, fc.name, None, cap, s_cap, fill, accent, drop_n, flags)
+        bb = el.image.getbbox()
+        w = bb[2] - bb[0]
+        if w <= target_w * 1.01:
+            break
+        cap *= target_w / w
+    # по центру старого логотипа, верх — на месте его верха
+    cx = (x0 + x1) / 2
+    px = cx - (bb[0] + bb[2]) / 2
+    py = y0 - bb[1]
+    m = 0.02 * W
+    if px + bb[0] < m:
+        px += m - (px + bb[0])
+    elif px + bb[2] > W - m:
+        px -= px + bb[2] - (W - m)
+    rect = (px + bb[0], py + bb[1], px + bb[2], py + bb[3])
+    dy = _fit_vertically(rect, W, H, bottom_reserve, avoid)
+    py += dy
+    poster.alpha_composite(el.image, (int(round(px)), int(round(py))))
+    return (px + bb[0], py + bb[1], px + bb[2], py + bb[3])
 
 
 def _union(boxes):
@@ -560,24 +696,57 @@ def add_badge(poster: Image.Image, text: str, near_box, color=(226, 52, 58), fon
     el.paste_on(poster, cx, y)
 
 
-def add_watermark(poster: Image.Image, logo_path: Path, rel_width: float = 0.11, corner: str = "tl"):
-    """Логотип в угол. Пустые края обрезаются, мягкая тень — чтобы белый лого был виден на светлом."""
+def _logo_image(logo_path: Path, W: int, rel_width: float) -> Image.Image | None:
     if not logo_path or not Path(logo_path).exists():
-        return
-    W, H = poster.size
+        return None
     logo = Image.open(logo_path).convert("RGBA")
     bbox = logo.getchannel("A").point(lambda a: 255 if a > 8 else 0).getbbox()
     if bbox:
         logo = logo.crop(bbox)
     lw = int(W * rel_width)
-    logo = logo.resize((lw, max(1, int(logo.height * lw / logo.width))), Image.LANCZOS)
+    return logo.resize((lw, max(1, int(logo.height * lw / logo.width))), Image.LANCZOS)
+
+
+def _logo_spots(W: int, H: int, lw: int, lh: int) -> dict:
+    m = int(W * 0.03)
+    return {"tl": (m, m), "tr": (W - lw - m, m), "bl": (m, H - lh - m), "br": (W - lw - m, H - lh - m)}
+
+
+def watermark_rect(size, logo_path: Path, rel_width: float = 0.11, corner: str = "tl"):
+    """Где встанет лого (x0, y0, x1, y1) — чтобы название его обходило."""
+    W, H = size
+    logo = _logo_image(logo_path, W, rel_width)
+    if logo is None:
+        return None
+    x, y = _logo_spots(W, H, logo.width, logo.height)[corner]
+    return (x, y, x + logo.width, y + logo.height)
+
+
+def add_watermark(poster: Image.Image, logo_path: Path, rel_width: float = 0.11, corner: str = "tl",
+                  avoid=None):
+    """Логотип в угол. Пустые края обрезаются, мягкая тень — чтобы белый лого был виден на светлом.
+    avoid — область названия: если лого всё же на неё налезает, переносим его в свободный угол."""
+    W, H = poster.size
+    logo = _logo_image(logo_path, W, rel_width)
+    if logo is None:
+        return
+    lw, lh = logo.size
     a = np.asarray(logo.getchannel("A"), np.float32) / 255
     pad = int(lw * 0.25)
-    sh = np.pad(a, pad)
-    sh = cv2.GaussianBlur(sh, (0, 0), lw * 0.045) * 0.55
+    sh = cv2.GaussianBlur(np.pad(a, pad), (0, 0), lw * 0.045) * 0.55
     shadow = Image.fromarray(np.dstack([np.zeros_like(sh)] * 3 + [sh * 255]).astype(np.uint8), "RGBA")
-    m = int(W * 0.03)
-    x, y = {"tl": (m, m), "tr": (W - lw - m, m), "bl": (m, H - logo.height - m),
-            "br": (W - lw - m, H - logo.height - m)}[corner]
+    spots = _logo_spots(W, H, lw, lh)
+
+    def hits(c):
+        if not avoid:
+            return False
+        x, y = spots[c]
+        gap = W * 0.008
+        ax0, ay0, ax1, ay1 = avoid
+        return x - gap < ax1 and ax0 < x + lw + gap and y - gap < ay1 and ay0 < y + lh + gap
+
+    order = [corner] + [c for c in ("tl", "tr", "bl", "br") if c != corner]
+    corner = next((c for c in order if not hits(c)), corner)
+    x, y = spots[corner]
     poster.alpha_composite(shadow, (x - pad + max(1, lw // 60), y - pad + max(1, lw // 40)))
     poster.alpha_composite(logo, (x, y))

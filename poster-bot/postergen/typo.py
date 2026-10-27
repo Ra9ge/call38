@@ -16,6 +16,7 @@ FONT_FILES = {
     "montserrat": "Montserrat[wght].ttf",  # подписи, «НОВАЯ ОЗВУЧКА»
     "unbounded": "Unbounded[wght].ttf",    # широкий жирный — как «ОТЕЛЬ ◆ ДЛЯ ◆ НЕЛЮДЕЙ»
     "rubik": "Rubik[wght].ttf",            # универсальный жирный
+    "tinos": "Tinos-Regular.ttf",          # с засечками — для тонких «минтё»-логотипов
 }
 SS = 2  # рисуем в 2 раза крупнее и уменьшаем — так края чище
 
@@ -66,6 +67,16 @@ class Shaped:
     cap: float
     patches: list = field(default_factory=list)   # (alpha uint8, x, y, char_index)
     chars: list = field(default_factory=list)
+    drop: bool = False                             # первая буква — крупная буквица
+    extra_bottom: float = 0.0
+
+    def line_alpha(self) -> np.ndarray:
+        """Буквы без буквицы — по ним ставим строку на место оригинальной."""
+        a = np.zeros((self.h, self.w), np.float32)
+        for p, x, y, i in self.patches:
+            if not (self.drop and i == 0):
+                _blit_max(a, p.astype(np.float32) / 255, x, y)
+        return a
 
     def alpha(self) -> np.ndarray:
         a = np.zeros((self.h, self.w), np.float32)
@@ -85,9 +96,28 @@ def _blit_max(dst, src, x, y):
     np.maximum(dst[y0:y1, x0:x1], s, out=dst[y0:y1, x0:x1])
 
 
+def _drop_cap(sh: "Shaped", ch: str, font, drop_font, pen: float, margin: int) -> float:
+    """Крупная первая буква (как огромный «陰» на постере): верх — вровень с заглавными строки."""
+    from PIL import ImageDraw
+    asc_b, desc_b = drop_font.getmetrics()
+    pad_b = int(drop_font.size * 0.35)
+    adv = drop_font.getlength(ch)
+    img = Image.new("L", (max(1, int(adv + 2 * pad_b)), max(1, int(asc_b + desc_b + 2 * pad_b))), 0)
+    ImageDraw.Draw(img).text((pad_b, pad_b + asc_b), ch, font=drop_font, fill=255, anchor="ls")
+    cap_top = sh.baseline - sh.cap
+    base_b = cap_top - 0.1 * sh.cap + cap_height(drop_font)
+    x = int(round(pen - pad_b))
+    y = int(round(base_b - pad_b - asc_b))
+    sh.patches.append((np.array(img), x, y, 0))
+    sh.drop = True
+    sh.extra_bottom = max(0.0, base_b + desc_b * 0.3 - (sh.baseline + font.getmetrics()[1]))
+    return adv + font.size * 0.06
+
+
 def shape_text(text: str, font, tracking: float = 0.0, jitter: dict | None = None,
-               cases: list[bool] | None = None, faux_bold: float = 0.0) -> Shaped:
-    """Раскладывает строку по буквам. tracking — доля кегля; jitter — «прыгающие» буквы."""
+               cases: list[bool] | None = None, faux_bold: float = 0.0, drop_font=None) -> Shaped:
+    """Раскладывает строку по буквам. tracking — доля кегля; jitter — «прыгающие» буквы;
+    drop_font — шрифт для крупной первой буквы (буквица)."""
     size = font.size
     asc, desc = font.getmetrics()
     margin = int(size * 0.6)
@@ -100,6 +130,10 @@ def shape_text(text: str, font, tracking: float = 0.0, jitter: dict | None = Non
     for i, ch in enumerate(text):
         if cases is not None and i < len(cases):
             ch = ch.upper() if cases[i] else ch.lower()
+        if i == 0 and drop_font is not None and not ch.isspace():
+            pen += _drop_cap(sh, ch, font, drop_font, pen, margin)
+            sh.chars.append(ch)
+            continue
         if prev is not None:
             pen += font.getlength(prev + ch) - font.getlength(prev) - font.getlength(ch)  # кернинг
         adv = font.getlength(ch)
@@ -124,7 +158,7 @@ def shape_text(text: str, font, tracking: float = 0.0, jitter: dict | None = Non
         pen += adv + tracking * size
         prev = ch
     sh.w = int(pen - tracking * size + margin)
-    sh.h = int(margin * 2 + asc + desc)
+    sh.h = int(margin * 2 + asc + desc + sh.extra_bottom)
     return sh
 
 
@@ -267,14 +301,16 @@ class Element:
         poster.alpha_composite(self.image, (int(round(x - self.cx)), int(round(y - self.cy))))
 
     def bbox_at(self, x: float, y: float):
-        """Видимая область (с обводкой) при установке в (x, y)."""
-        bb = self.image.getbbox() or (0, 0, *self.image.size)
+        """Видимая область (с обводкой, без почти прозрачного края тени) при установке в (x, y)."""
+        bb = self.image.getchannel("A").point(lambda a: 255 if a > 40 else 0).getbbox() \
+            or (0, 0, *self.image.size)
         ox, oy = x - self.cx, y - self.cy
         return (ox + bb[0], oy + bb[1], ox + bb[2], oy + bb[3])
 
 
-def finish(layer: Layer, fill_alpha: np.ndarray) -> Element:
-    """Обрезает пустые края, уменьшает в SS раз, точка привязки — центр букв."""
+def finish(layer: Layer, fill_alpha: np.ndarray, anchor_alpha: np.ndarray | None = None) -> Element:
+    """Обрезает пустые края, уменьшает в SS раз, точка привязки — центр букв
+    (по вертикали — центр anchor_alpha, если задан: строка без буквицы)."""
     a = layer.a
     ys, xs = np.nonzero(a > 0.004)
     if len(xs) == 0:
@@ -285,6 +321,10 @@ def finish(layer: Layer, fill_alpha: np.ndarray) -> Element:
     if len(fx):
         fcx, fcy = (fx.min() + fx.max()) / 2, (fy.min() + fy.max()) / 2
         fw, fh = fx.max() - fx.min(), fy.max() - fy.min()
+        if anchor_alpha is not None:
+            ay = np.nonzero(anchor_alpha.max(1) > 0.3)[0]
+            if len(ay):
+                fcy = (ay.min() + ay.max()) / 2
     else:
         fcx, fcy, fw, fh = (x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0
     # выравниваем по сетке SS
