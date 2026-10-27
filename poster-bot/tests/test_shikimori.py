@@ -36,7 +36,7 @@ def test_graphql(monkeypatch):
     info = fetch_anime("13759")
     assert info.russian == "Кошечка из Сакурасо"
     assert info.poster_url.endswith("x.jpeg")
-    assert info.url == "https://shiki.one/animes/z13759"
+    assert info.url == "https://shikimori.one/animes/z13759"
     assert calls[0][1].startswith("https://shikimori.io")  # сначала основной домен, потом запасные
 
 
