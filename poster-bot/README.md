@@ -71,7 +71,7 @@ run.bat https://shikimori.one/animes/z13759-sakura-sou-no-pet-na-kanojo
 ## Как это работает
 
 1. `postergen/shikimori.py` — данные и постер (GraphQL, запасной REST, домены
-   shikimori.one → shiki.one → shikimori.io; свой домен — переменная `SHIKIMORI_URL`).
+   shikimori.io → shikimori.one → shiki.one → shikimori.me; свой домен — переменная `SHIKIMORI_URL`).
 2. `postergen/detect.py` — поиск текста (RapidOCR, модели уже внутри пакета) и выбор блока
    с японским названием.
 3. `postergen/logo.py` — разбор логотипа: точная маска букв с обводкой (персонажи вокруг

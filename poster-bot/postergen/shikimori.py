@@ -12,7 +12,7 @@ from PIL import Image
 
 # Shikimori несколько раз переезжал между доменами, поэтому пробуем по очереди.
 # Свой домен можно задать переменной окружения SHIKIMORI_URL.
-DEFAULT_DOMAINS = ("https://shikimori.one", "https://shiki.one", "https://shikimori.io")
+DEFAULT_DOMAINS = ("https://shikimori.io", "https://shikimori.one", "https://shiki.one", "https://shikimori.me")
 USER_AGENT = os.environ.get("SHIKIMORI_USER_AGENT", "PosterBot/1.0")
 
 GRAPHQL_QUERY = """

@@ -24,7 +24,7 @@ def test_graphql(monkeypatch):
 
     def fake_request(self, method, url, timeout=None, **kw):
         calls.append((method, url))
-        if url.startswith("https://shikimori.one"):
+        if url.startswith("https://shikimori.io"):
             raise requests.ConnectionError("blocked")
         return FakeResp(200, {"data": {"animes": [{
             "id": "13759", "name": "Sakurasou no Pet na Kanojo", "russian": "Кошечка из Сакурасо",
@@ -37,7 +37,7 @@ def test_graphql(monkeypatch):
     assert info.russian == "Кошечка из Сакурасо"
     assert info.poster_url.endswith("x.jpeg")
     assert info.url == "https://shiki.one/animes/z13759"
-    assert calls[0][1].startswith("https://shikimori.one")  # сначала основной домен, потом запасной
+    assert calls[0][1].startswith("https://shikimori.io")  # сначала основной домен, потом запасные
 
 
 def test_rest_fallback(monkeypatch):
@@ -53,4 +53,4 @@ def test_rest_fallback(monkeypatch):
     info = fetch_anime(13759)
     assert info.english == "The Pet Girl of Sakurasou"
     assert info.year == 2012
-    assert info.poster_url == "https://shikimori.one/system/animes/original/13759.jpg"
+    assert info.poster_url == "https://shikimori.io/system/animes/original/13759.jpg"
