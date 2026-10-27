@@ -276,13 +276,23 @@ def inpaint(img: np.ndarray, mask: np.ndarray, method: str = "auto") -> tuple[np
     return inpaint_opencv(img, mask), "opencv"
 
 
-def halo_mask(img: np.ndarray, mask: np.ndarray, h: float) -> np.ndarray:
-    """Тень и свечение вокруг букв — то, что не попало в маску букв, но после стирания
-    остаётся тёмным (или светлым) «призраком» надписи.
+def _shift(m: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    out = np.zeros_like(m)
+    H, W = m.shape[:2]
+    xs, xd = (slice(0, W - dx), slice(dx, W)) if dx >= 0 else (slice(-dx, W), slice(0, W + dx))
+    ys, yd = (slice(0, H - dy), slice(dy, H)) if dy >= 0 else (slice(-dy, H), slice(0, H + dy))
+    out[yd, xd] = m[ys, xs]
+    return out
 
-    Смотрим полосу вокруг маски шириной ~0.2 высоты букв и сравниваем с фоном чуть дальше
-    (оценка фона в каждой точке — сглаженный цвет внешнего кольца). Что заметно темнее фона
-    или сильно отличается по цвету — добавляем к маске (только куски, примыкающие к буквам)."""
+
+def halo_mask(img: np.ndarray, mask: np.ndarray, h: float) -> np.ndarray:
+    """Тень и свечение букв — то, что не попало в маску букв, но после стирания остаётся
+    тёмным (или светлым) «призраком» надписи.
+
+    Тень повторяет форму букв со сдвигом, свечение — обводит буквы со всех сторон. Поэтому
+    ищем сдвиг, при котором «буквы со сдвигом» ложатся на заметно более тёмную (или светлую)
+    полосу вокруг букв, и стираем только эту полосу. Персонажи и предметы рядом с надписью
+    по форме на буквы не похожи — их не трогаем."""
     m = mask > 0
     if not m.any() or h <= 0:
         return np.zeros_like(mask)
@@ -300,17 +310,43 @@ def halo_mask(img: np.ndarray, mask: np.ndarray, h: float) -> np.ndarray:
     outer = ((dist <= 2.6 * r) & (dist > 1.4 * r)).astype(np.float32)
     sig = 1.6 * r
     den = cv2.GaussianBlur(outer, (0, 0), sig)
-    est = cv2.GaussianBlur(lab * outer[..., None], (0, 0), sig) / np.maximum(den, 1e-6)[..., None]
-    valid = den > 0.03
-    dL = lab[..., 0] - est[..., 0]
-    dE = np.linalg.norm(lab - est, axis=2)
-    halo = near & valid & ((dL < -14) | (dE > 30))
-    # только куски, которые касаются букв
-    n, lab_cc = cv2.connectedComponents((halo | (mm > 0)).astype(np.uint8))
-    touch = np.unique(lab_cc[mm > 0])
-    keep = np.isin(lab_cc, touch[touch > 0]) & halo
-    keep = cv2.morphologyEx(keep.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    keep = cv2.dilate(keep, np.ones((3, 3), np.uint8))
+    est = cv2.GaussianBlur(lab[..., 0] * outer, (0, 0), sig) / np.maximum(den, 1e-6)
+    valid = near & (den > 0.03)
+    dL = lab[..., 0] - est                         # темнее (<0) или светлее (>0) фона вокруг
+
+    steps = sorted({0, r // 4, r // 2, (3 * r) // 4, r} | {-v for v in (r // 4, r // 2, (3 * r) // 4, r)})
+    best = (0.0, None)
+    for sign in (-1, 1):                           # тень (темнее) или свечение (светлее)
+        hit = valid & (sign * dL > 10)
+        if hit.sum() < 0.02 * mm.sum():
+            continue
+        frac = {}
+        for dx in steps:
+            for dy in steps:
+                if dx == 0 and dy == 0:
+                    ring = (dist <= 0.5 * r) & (mm == 0) & valid          # свечение со всех сторон
+                else:
+                    ring = (_shift(mm, dx, dy) > 0) & (mm == 0) & valid   # тень со сдвигом
+                n = int(ring.sum())
+                frac[dx, dy] = float((ring & hit).sum()) / n if n >= 0.02 * mm.sum() else 0.0
+        for (dx, dy), f in frac.items():
+            if dx == 0 and dy == 0:
+                score = f if f >= 0.45 else 0.0                           # свечение — равномерно вокруг
+            else:
+                # тень — с одной стороны: в сторону сдвига темно, в обратную — нет
+                score = f - frac.get((-dx, -dy), 0.0)
+                score = score if f >= 0.25 and score >= 0.12 else 0.0
+            if score > best[0]:
+                best = (score, (sign, dx, dy))
+    if best[1] is None:
+        return np.zeros_like(mask)
+    sign, dx, dy = best[1]
+    base = (dist <= 0.5 * r) if dx == 0 and dy == 0 else (_shift(mm, dx, dy) > 0)
+    # полоса тени с размытым краем: «буквы со сдвигом» + немного вокруг, и только где заметно темнее/светлее
+    reach = cv2.distanceTransform((~base).astype(np.uint8), cv2.DIST_L2, 3) <= 0.35 * r
+    halo = reach & (mm == 0) & valid & (sign * dL > 6)
+    halo = cv2.morphologyEx(halo.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    halo = cv2.dilate(halo, np.ones((3, 3), np.uint8))
     out = np.zeros_like(mask)
-    out[y0:y1, x0:x1] = np.where(keep > 0, 255, 0).astype(mask.dtype)
+    out[y0:y1, x0:x1] = np.where(halo > 0, 255, 0).astype(mask.dtype)
     return out

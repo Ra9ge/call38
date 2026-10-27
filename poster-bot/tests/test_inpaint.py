@@ -33,3 +33,13 @@ def test_halo_catches_drop_shadow():
     shadow[160:172, 108:510] = True
     assert halo[shadow].mean() > 0.9                   # тень попала в маску
     assert not halo[250:, :].any() and not halo[:, 560:].any()   # а фон вдали — нет
+
+
+def test_halo_leaves_nearby_objects_alone():
+    img = np.full((300, 600, 3), 150, np.uint8)
+    mask = np.zeros((300, 600), np.uint8)
+    mask[100:160, 100:500] = 255
+    img[100:160, 100:500] = 250
+    img[165:200, 300:340] = 255                        # белая собака под буквами — не тень
+    img[165:190, 200:230] = 30                         # тёмный предмет — тоже не тень
+    assert not (halo_mask(img, mask, 60) > 0).any()
