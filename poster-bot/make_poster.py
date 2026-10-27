@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from postergen.pipeline import Options, make_poster  # noqa: E402
-from postergen.shikimori import AnimeInfo, ShikimoriError, download_poster, fetch_anime, parse_anime_id  # noqa: E402
+from postergen.shikimori import (AnimeInfo, ShikimoriError, download_poster, fetch_anime,  # noqa: E402
+                                 parse_anime_id, set_proxy)
 from postergen.titles import slug  # noqa: E402
 
 
@@ -51,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--distress", type=float, default=1.0, help="сила потёртостей (0 — без них)")
     p.add_argument("--image", help="взять постер из файла, а не с Shikimori")
     p.add_argument("--format", choices=["png", "jpg", "webp"], default="png")
+    p.add_argument("--proxy", help="прокси для Shikimori, если VPN только в браузере: "
+                   "http://127.0.0.1:10809 или socks5://127.0.0.1:10808")
     p.add_argument("--debug", action="store_true", help="сохранить промежуточные картинки")
     return p
 
@@ -116,6 +119,8 @@ def _safe_console():
 def main(argv=None) -> int:
     _safe_console()
     args = build_parser().parse_args(argv)
+    if args.proxy:
+        set_proxy(args.proxy)
     items = args.anime
     if not items:
         try:

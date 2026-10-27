@@ -30,8 +30,8 @@ from PIL import Image
 from . import pipeline
 from .inpaint import lama_ready
 from .pipeline import Options, make_poster
-from .shikimori import (AnimeInfo, ShikimoriError, ShikimoriUnavailable, download_poster_bytes, fetch_anime,
-                        list_animes, parse_anime_id)
+from .shikimori import (AnimeInfo, ShikimoriError, ShikimoriUnavailable, describe_error, download_poster_bytes,
+                        fetch_anime, list_animes, parse_anime_id)
 from .titles import slug
 
 RETRY_DELAYS = (5, 15, 30, 60, 120, 300, 600)   # паузы между повторами; дальше — по 10 минут
@@ -147,18 +147,24 @@ def with_retries(fn, what: str, log: Log, stop: threading.Event, forever: bool =
         try:
             return fn()
         except ShikimoriUnavailable as e:
-            err, network = str(e).splitlines()[0], False
+            err, network = str(e), False
         except ShikimoriError:
             raise
         except requests.RequestException as e:
-            err, network = f"{e.__class__.__name__}: {e}", True
+            err, network = describe_error(e), True
         attempt += 1
         if stop.is_set():
             raise ShikimoriUnavailable(f"{what}: остановлено")
         if not (forever or network) and attempt > len(RETRY_DELAYS):
             raise ShikimoriUnavailable(f"{what}: {err}")
         delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS)) - 1]
-        log(f"  нет связи ({what}): {err[:120]} — повтор через {delay} с")
+        if attempt == 1:     # в первый раз — причина целиком (по каждому адресу), дальше коротко
+            log(f"  нет связи ({what}), повтор через {delay} с. Причина: {err}")
+            if "Shikimori недоступен" in err:
+                log("  Проверь, открывается ли https://shikimori.io в браузере. Если там работает только "
+                    "через VPN — включи VPN для всей системы или запусти с --proxy (см. check.bat).")
+        else:
+            log(f"  всё ещё нет связи ({what}), попытка {attempt + 1}, повтор через {delay} с")
         if stop.wait(delay):
             raise ShikimoriUnavailable(f"{what}: остановлено")
 

@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 from make_poster import _safe_console, hex_color  # noqa: E402
 from postergen.batch import BatchConfig, run_batch  # noqa: E402
 from postergen.pipeline import Options  # noqa: E402
-from postergen.shikimori import ORDERS  # noqa: E402
+from postergen.shikimori import ORDERS, set_proxy  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -51,10 +51,14 @@ def main(argv=None) -> int:
     p.add_argument("--logo", default=str(ROOT / "assets" / "logo.png"), help="лого в углу; none — без него")
     p.add_argument("--logo-corner", choices=["tl", "tr", "bl", "br"], default="tl")
     p.add_argument("--inpaint", choices=["auto", "lama", "opencv"], default="auto")
+    p.add_argument("--proxy", help="прокси для Shikimori, если VPN только в браузере: "
+                   "http://127.0.0.1:10809 или socks5://127.0.0.1:10808")
     p.add_argument("--allow-opencv", action="store_true",
                    help="работать, даже если нейросеть LaMa не скачалась (качество хуже)")
     args = p.parse_args(argv)
 
+    if args.proxy:
+        set_proxy(args.proxy)
     ids = list(args.anime)
     if args.ids_file:
         lines = Path(args.ids_file).read_text(encoding="utf-8").splitlines()
