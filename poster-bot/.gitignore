@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 output/
-models/lama_fp32.onnx
+models/*.onnx
 models/*.part
 models/.lama_download_failed
 bot_token.txt

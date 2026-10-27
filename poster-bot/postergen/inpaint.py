@@ -9,12 +9,21 @@ import cv2
 import numpy as np
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
-LAMA_FILE = MODELS_DIR / "lama_fp32.onnx"
-LAMA_URLS = [u for u in [
-    os.environ.get("LAMA_URL"),
-    "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx",
-    "https://hf-mirror.com/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx",
-] if u]
+
+# Где брать нейросеть LaMa (по очереди). GitHub (зоопарк моделей OpenCV) открывается почти везде,
+# HuggingFace — запасной вариант. (файл, адрес, sha1 или None)
+LAMA_SOURCES = [
+    ("inpainting_lama_2025jan.onnx",
+     "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/inpainting_lama/"
+     "inpainting_lama_2025jan.onnx",
+     "7c6cdb9362bf73de2a80cfcaf17e121e3302f24c"),
+    ("lama_fp32.onnx", "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx", None),
+    ("lama_fp32.onnx", "https://hf-mirror.com/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx", None),
+]
+if os.environ.get("LAMA_URL"):
+    LAMA_SOURCES.insert(0, ("lama_custom.onnx", os.environ["LAMA_URL"], None))
+LAMA_FILE: Path | None = None          # можно задать вручную (используется в тестах)
+FAIL_MARKER = MODELS_DIR / ".lama_download_failed"
 
 _SESSION = None
 _LAMA_FAILED = False
@@ -24,21 +33,30 @@ def log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
 
-FAIL_MARKER = MODELS_DIR / ".lama_download_failed"
+def _existing_model() -> Path | None:
+    if LAMA_FILE is not None:
+        return LAMA_FILE if Path(LAMA_FILE).exists() else None
+    for name, _, _ in LAMA_SOURCES:
+        if (MODELS_DIR / name).exists():
+            return MODELS_DIR / name
+    return None
 
 
-def _download_lama() -> bool:
+def _download_lama() -> Path | None:
+    import hashlib
     import time
 
     import requests
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     # если недавно не скачалась — не тормозим каждый запуск (повтор через сутки)
     if FAIL_MARKER.exists() and time.time() - FAIL_MARKER.stat().st_mtime < 24 * 3600:
-        return False
-    tmp = LAMA_FILE.with_suffix(".part")
-    for url in LAMA_URLS:
+        return None
+    for name, url, sha1 in LAMA_SOURCES:
+        target = MODELS_DIR / name
+        tmp = target.with_suffix(".part")
         try:
-            log(f"Скачиваю нейросеть LaMa для чистого удаления текста (~200 МБ, один раз): {url}")
+            log(f"Скачиваю нейросеть LaMa для чистого удаления текста (~100–200 МБ, один раз): {url}")
+            h = hashlib.sha1()
             with requests.get(url, stream=True, timeout=(10, 60)) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
@@ -46,31 +64,56 @@ def _download_lama() -> bool:
                 with open(tmp, "wb") as f:
                     for chunk in r.iter_content(1 << 20):
                         f.write(chunk)
+                        h.update(chunk)
                         done += len(chunk)
                         if total:
                             print(f"\r  {done * 100 // total}%", end="", file=sys.stderr, flush=True)
             print(file=sys.stderr)
-            tmp.replace(LAMA_FILE)
+            if sha1 and h.hexdigest() != sha1:
+                raise ValueError("файл повреждён (не совпала контрольная сумма)")
+            tmp.replace(target)
             FAIL_MARKER.unlink(missing_ok=True)
-            return True
-        except Exception as e:  # сеть/прокси/блокировка — пробуем следующее зеркало
+            return target
+        except Exception as e:  # сеть/прокси/блокировка — пробуем следующий источник
             log(f"  не получилось: {e}")
             tmp.unlink(missing_ok=True)
     FAIL_MARKER.touch()
     log("LaMa не скачалась; следующая попытка через сутки (или удали models/.lama_download_failed).")
-    return False
+    return None
+
+
+def _open_session(path: Path):
+    """Загружает модель. Оптимизированную копию сохраняем рядом — следующие запуски быстрее."""
+    import onnxruntime as ort
+    cached = path.with_name(path.stem + ".optimized.onnx")
+    if cached.exists() and cached.stat().st_mtime >= path.stat().st_mtime:
+        try:
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            so.log_severity_level = 3
+            return ort.InferenceSession(str(cached), so, providers=["CPUExecutionProvider"])
+        except Exception:
+            cached.unlink(missing_ok=True)
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    try:
+        so.optimized_model_filepath = str(cached)
+    except Exception:
+        pass
+    return ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
 
 
 def _lama_session(allow_download: bool):
     global _SESSION, _LAMA_FAILED
     if _SESSION is not None or _LAMA_FAILED:
         return _SESSION
-    if not LAMA_FILE.exists() and not (allow_download and _download_lama()):
+    path = _existing_model() or (_download_lama() if allow_download else None)
+    if path is None:
         _LAMA_FAILED = True
         return None
     try:
-        import onnxruntime as ort
-        _SESSION = ort.InferenceSession(str(LAMA_FILE), providers=["CPUExecutionProvider"])
+        log("Загружаю нейросеть LaMa...")
+        _SESSION = _open_session(path)
     except Exception as e:
         log(f"LaMa не загрузилась ({e}), использую OpenCV")
         _LAMA_FAILED = True

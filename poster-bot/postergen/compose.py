@@ -560,14 +560,24 @@ def add_badge(poster: Image.Image, text: str, near_box, color=(226, 52, 58), fon
     el.paste_on(poster, cx, y)
 
 
-def add_watermark(poster: Image.Image, logo_path: Path, rel_width: float = 0.12, corner: str = "tl"):
+def add_watermark(poster: Image.Image, logo_path: Path, rel_width: float = 0.11, corner: str = "tl"):
+    """Логотип в угол. Пустые края обрезаются, мягкая тень — чтобы белый лого был виден на светлом."""
     if not logo_path or not Path(logo_path).exists():
         return
     W, H = poster.size
     logo = Image.open(logo_path).convert("RGBA")
+    bbox = logo.getchannel("A").point(lambda a: 255 if a > 8 else 0).getbbox()
+    if bbox:
+        logo = logo.crop(bbox)
     lw = int(W * rel_width)
     logo = logo.resize((lw, max(1, int(logo.height * lw / logo.width))), Image.LANCZOS)
+    a = np.asarray(logo.getchannel("A"), np.float32) / 255
+    pad = int(lw * 0.25)
+    sh = np.pad(a, pad)
+    sh = cv2.GaussianBlur(sh, (0, 0), lw * 0.045) * 0.55
+    shadow = Image.fromarray(np.dstack([np.zeros_like(sh)] * 3 + [sh * 255]).astype(np.uint8), "RGBA")
     m = int(W * 0.03)
-    pos = {"tl": (m, m), "tr": (W - lw - m, m), "bl": (m, H - logo.height - m),
-           "br": (W - lw - m, H - logo.height - m)}[corner]
-    poster.alpha_composite(logo, pos)
+    x, y = {"tl": (m, m), "tr": (W - lw - m, m), "bl": (m, H - logo.height - m),
+            "br": (W - lw - m, H - logo.height - m)}[corner]
+    poster.alpha_composite(shadow, (x - pad + max(1, lw // 60), y - pad + max(1, lw // 40)))
+    poster.alpha_composite(logo, (x, y))
