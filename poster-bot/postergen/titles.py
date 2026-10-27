@@ -119,3 +119,9 @@ def resolve_titles(info, kind: str | None = None) -> tuple[ParsedTitle, str | No
     if sub and ru.title and sub.strip().lower() == ru.title.strip().lower():
         sub = None
     return ru, sub
+
+
+def slug(text: str) -> str:
+    """Безопасное имя файла: 'Sakurasou no Pet na Kanojo' -> 'sakurasou-no-pet-na-kanojo'."""
+    s = re.sub(r"[^\w\-]+", "-", (text or "").lower(), flags=re.UNICODE).strip("-")
+    return s[:60] or "poster"

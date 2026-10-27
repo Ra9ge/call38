@@ -186,6 +186,19 @@ class Layer:
         self.rgb = c * al[..., None] + self.rgb * (1 - al[..., None])
         self.a = al + self.a * (1 - al)
 
+    def over_patch(self, color, patch: np.ndarray, x: int, y: int):
+        """Как over(), но только в клетке буквы (patch — alpha 0..1 с левым верхним углом в x, y)."""
+        H, W = self.a.shape
+        h, w = patch.shape
+        x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return
+        al = np.clip(patch[y0 - y:y1 - y, x0 - x:x1 - x], 0, 1)
+        c = np.asarray(color, np.float32) / 255.0
+        rgb = self.rgb[y0:y1, x0:x1]
+        self.rgb[y0:y1, x0:x1] = c * al[..., None] + rgb * (1 - al[..., None])
+        self.a[y0:y1, x0:x1] = al + self.a[y0:y1, x0:x1] * (1 - al)
+
     def over_layer(self, other: "Layer", x: int = 0, y: int = 0):
         H, W = self.a.shape
         h, w = other.a.shape
@@ -225,9 +238,7 @@ def per_glyph_fill(sh: Shaped, colors: list) -> tuple[np.ndarray, np.ndarray]:
     """Заливка: каждая буква своим цветом. Возвращает (rgb премульт., alpha)."""
     lay = Layer(sh.w, sh.h)
     for p, x, y, idx in sh.patches:
-        a = np.zeros((sh.h, sh.w), np.float32)
-        _blit_max(a, p.astype(np.float32) / 255, x, y)
-        lay.over(colors[idx % len(colors)] if colors else (255, 255, 255), a)
+        lay.over_patch(colors[idx % len(colors)] if colors else (255, 255, 255), p.astype(np.float32) / 255, x, y)
     return lay.rgb, lay.a
 
 

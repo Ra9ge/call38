@@ -4,7 +4,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .typo import (SS, Element, Layer, Shaped, _blit_max, blur, dilate, finish, font_for_cap, grunge,
+from .typo import (SS, Element, Layer, Shaped, blur, dilate, finish, font_for_cap, grunge,
                    measure, per_glyph_fill, rounded_rect_alpha, shape_text, shift, spread_colors)
 
 SHADOW = (30, 22, 40)
@@ -227,11 +227,8 @@ def _ink_x(sh: Shaped) -> tuple[float, float]:
 
 def _paint(layer: Layer, sh: Shaped, colors: list, dx: float, dy: float):
     """Рисует разложенную строку на холсте со сдвигом; colors — цвет каждой буквы."""
-    H, W = layer.a.shape
     for p, x, y, idx in sh.patches:
-        a = np.zeros((H, W), np.float32)
-        _blit_max(a, p.astype(np.float32) / 255, int(round(x + dx)), int(round(y + dy)))
-        layer.over(colors[idx], a)
+        layer.over_patch(colors[idx], p.astype(np.float32) / 255, int(round(x + dx)), int(round(y + dy)))
 
 
 def dropcap_title(text: str, subtitle: str | None, font: str, weight: int | None, cap: float,

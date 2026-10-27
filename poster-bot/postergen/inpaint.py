@@ -208,6 +208,11 @@ def inpaint_opencv(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.clip(res.astype(np.float32) + noise * soft, 0, 255).astype(np.uint8)
 
 
+def lama_ready(allow_download: bool = True) -> bool:
+    """Нейросеть LaMa на месте и загружена (при необходимости скачивает её)."""
+    return _lama_session(allow_download) is not None
+
+
 def inpaint(img: np.ndarray, mask: np.ndarray, method: str = "auto") -> tuple[np.ndarray, str]:
     if not (mask > 0).any():
         return img.copy(), "none"

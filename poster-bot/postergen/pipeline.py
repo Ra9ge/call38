@@ -51,8 +51,12 @@ class Report:
     subtitle: str | None = None
 
 
+VERBOSE = True   # в ночном режиме шаги каждого постера не печатаем
+
+
 def log(msg: str):
-    print(msg, file=sys.stderr, flush=True)
+    if VERBOSE:
+        print(msg, file=sys.stderr, flush=True)
 
 
 def _prepare(img: Image.Image, min_width: int) -> Image.Image:

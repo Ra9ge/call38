@@ -20,11 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from postergen.pipeline import Options, make_poster  # noqa: E402
 from postergen.shikimori import AnimeInfo, ShikimoriError, download_poster, fetch_anime, parse_anime_id  # noqa: E402
-
-
-def slug(text: str) -> str:
-    s = re.sub(r"[^\w\-]+", "-", text.lower(), flags=re.UNICODE).strip("-")
-    return s[:60] or "poster"
+from postergen.titles import slug  # noqa: E402
 
 
 def hex_color(s: str) -> tuple:
