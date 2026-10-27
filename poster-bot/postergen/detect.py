@@ -93,7 +93,8 @@ class Cluster:
 
 
 def detect_text(img_rgb: np.ndarray) -> list[TextBox]:
-    res = _engine()(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+    # режимы указываем явно: движок запоминает параметры прошлого вызова
+    res = _engine()(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), use_det=True, use_cls=True, use_rec=True)
     if res.boxes is None:
         return []
     return [TextBox(b, t, float(s)) for b, t, s in zip(res.boxes, res.txts, res.scores) if t.strip()]
@@ -138,15 +139,84 @@ def _rows(boxes: list[TextBox]) -> list[Row]:
     return rows
 
 
-def find_title(boxes: list[TextBox], img_shape, min_rel_size: float = 0.045,
-               min_score: float = 0.45) -> tuple[Cluster | None, list[Cluster]]:
-    """Возвращает (кластер японского названия или None, остальной японский текст)."""
+@dataclass
+class LogoFind:
+    cluster: Cluster | None                               # главная часть логотипа (её заменяем)
+    subtitle: list[TextBox] = field(default_factory=list)  # подпись другим языком рядом (стираем и набираем заново)
+    decor: list[TextBox] = field(default_factory=list)     # мелкие надписи внутри логотипа (просто стираем)
+    others: list[Cluster] = field(default_factory=list)    # прочий японский текст на постере (стираем)
+    latin: bool = False                                    # логотип латиницей (HUNTER×HUNTER, Steins;Gate…)
+    match: float = 0.0                                     # насколько совпал с названием аниме
+    matched_title: str | None = None
+
+
+def _letters(t: str) -> int:
+    return sum(ch.isalnum() for ch in t)
+
+
+def find_logo(boxes: list[TextBox], img_shape, variants: list[str] = (), min_score: float = 0.45) -> LogoFind:
+    """Ищет логотип с названием — японский или латиницей.
+
+    Кандидаты — заметные надписи. Логотип: крупный японский текст (как раньше), или текст, похожий
+    на одно из названий аниме, или очень крупная латиница. Из похожих выбирается крупнейший.
+    """
+    from .titles import title_match
+
     H = img_shape[0]
-    cjk = [b for b in boxes if b.cjk and b.score >= min_score]
-    clusters = [Cluster(g) for g in _group(cjk)]
+    cands = [b for b in boxes if b.score >= min_score and b.size >= 0.015 * H and _letters(b.text) >= 1]
+    clusters = [Cluster(g) for g in _group(cands)]
+    best, best_score, best_info = None, 0.0, (0.0, None)
     for c in clusters:
-        c.rows = _rows(c.boxes)
-    clusters.sort(key=lambda c: c.size * math.sqrt(sum(b.run for b in c.boxes)), reverse=True)
-    if clusters and clusters[0].size >= min_rel_size * H:
-        return clusters[0], clusters[1:]
-    return None, clusters
+        main = max(c.boxes, key=lambda b: b.size)
+        main_parts = [b for b in c.boxes if b.size >= 0.45 * main.size and b.cjk == main.cjk]
+        text = " ".join(b.text for b in sorted(main_parts, key=lambda b: (round(b.cy / max(1.0, main.size)), b.cx)))
+        match, which = title_match(text, list(variants)) if variants else (0.0, None)
+        for b in main_parts:                       # строка логотипа может быть частью названия
+            m, w = title_match(b.text, list(variants)) if variants else (0.0, None)
+            if m > match:
+                match, which = m, w
+        size = main.size / H
+        if main.cjk:
+            ok = size >= 0.045 or (match >= 0.6 and size >= 0.025)
+        else:
+            ok = (match >= 0.6 and size >= 0.03 and _letters(text) >= 3) \
+                or (size >= 0.07 and _letters(text) >= 3 and main.score >= 0.6)
+        if not ok:
+            continue
+        score = main.size * math.sqrt(sum(b.run for b in main_parts)) * (1 + 1.5 * match)
+        if score > best_score:
+            best, best_score, best_info = c, score, (match, which)
+
+    if best is None:
+        others = [c for c in clusters if any(b.cjk for b in c.boxes)]
+        cjk_others = [Cluster([b for b in c.boxes if b.cjk]) for c in others]
+        return LogoFind(None, others=[c for c in cjk_others if c.boxes])
+
+    main = max(best.boxes, key=lambda b: b.size)
+    if main.cjk:
+        # японский логотип: все японские части остаются (таблички, подписи «TVアニメ»…), латиница — подпись
+        core = [b for b in best.boxes if b.cjk]
+        subtitle = [b for b in best.boxes if not b.cjk]
+        decor = []
+    else:
+        # логотип латиницей: крупные строки — название, мелкая латиница — подпись, японское — украшение
+        core = [b for b in best.boxes if not b.cjk and b.size >= 0.45 * main.size]
+        subtitle = [b for b in best.boxes if not b.cjk and b.size < 0.45 * main.size]
+        decor = [b for b in best.boxes if b.cjk]
+    logo = Cluster(core)
+    logo.rows = _rows(core)
+    others = []
+    for c in clusters:
+        if c is best:
+            continue
+        cjk = [b for b in c.boxes if b.cjk]
+        if cjk:
+            others.append(Cluster(cjk))
+    return LogoFind(logo, subtitle, decor, others, latin=not main.cjk, match=best_info[0],
+                    matched_title=best_info[1])
+
+
+def find_title(boxes: list[TextBox], img_shape, variants: list[str] = ()) -> tuple[Cluster | None, list[Cluster]]:
+    """Старый интерфейс: (кластер логотипа или None, прочий японский текст)."""
+    f = find_logo(boxes, img_shape, variants)
+    return f.cluster, f.others

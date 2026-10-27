@@ -331,6 +331,7 @@ def write_report(out_dir: Path, state: State, started: str):
             f'<div class="row"><img class="orig" loading="lazy" src="_thumbs/{i}-orig.jpg" alt=""'
             f' title="оригинал"><div><div class="t">{e(r.get("title") or r.get("name") or "")}</div>'
             f'<div class="m">{link} · {e(MODE_RU.get(r.get("mode"), r.get("mode") or ""))}'
+            f'{" (" + e(r["logo"]) + ")" if r.get("logo") else ""}'
             f' · {r.get("seconds", "?")} с</div></div></div></div>')
     rows = "".join(f'<tr><td>{int(r["id"])}</td><td>{e(r.get("title") or r.get("name") or "")}</td>'
                    f'<td>{e((r.get("error") or "")[:300])}</td></tr>' for r in bad)
@@ -464,7 +465,7 @@ def run_batch(cfg: BatchConfig) -> int:
                 times.append(dt)
                 n_ok += 1
                 state.add({"id": info.id, "status": "ok", "name": info.name, "title": rep.title,
-                           "mode": rep.mode, "inpaint": rep.inpaint, "seconds": round(dt, 1),
+                           "mode": rep.mode, "logo": rep.logo, "inpaint": rep.inpaint, "seconds": round(dt, 1),
                            "file": f"posters/{name}", "url": info.url})
                 recent = times[-50:]
                 avg = sum(recent) / len(recent)

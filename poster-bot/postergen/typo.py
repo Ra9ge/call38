@@ -16,7 +16,7 @@ FONT_FILES = {
     "montserrat": "Montserrat[wght].ttf",  # подписи, «НОВАЯ ОЗВУЧКА»
     "unbounded": "Unbounded[wght].ttf",    # широкий жирный — как «ОТЕЛЬ ◆ ДЛЯ ◆ НЕЛЮДЕЙ»
     "rubik": "Rubik[wght].ttf",            # универсальный жирный
-    "tinos": "Tinos-Regular.ttf",          # с засечками — для тонких «минтё»-логотипов
+    "tinos": "Tinos-Bold.ttf",             # с засечками (жирный) — для тонких «минтё»-логотипов
 }
 SS = 2  # рисуем в 2 раза крупнее и уменьшаем — так края чище
 
@@ -42,6 +42,27 @@ def get_font(name: str, px: int, weight: int | None = None) -> ImageFont.FreeTyp
         except (OSError, AttributeError, KeyError):
             pass  # не вариативный шрифт
     return f
+
+
+_GLYPHS: dict = {}
+
+
+def has_glyph(font, ch: str) -> bool:
+    """Есть ли буква в шрифте (иначе рисуется «квадратик»)."""
+    if ch.isspace():
+        return True
+    key = (font.path, font.size, ch)
+    if key not in _GLYPHS:
+        def render(c):
+            from PIL import ImageDraw
+            im = Image.new("L", (int(font.size * 2), int(font.size * 2)), 0)
+            ImageDraw.Draw(im).text((font.size // 2, font.size // 2), c, font=font, fill=255)
+            return np.asarray(im)
+        miss_key = (font.path, font.size, None)
+        if miss_key not in _GLYPHS:
+            _GLYPHS[miss_key] = render("\ue000")      # символа из частной области в шрифтах нет
+        _GLYPHS[key] = not np.array_equal(render(ch), _GLYPHS[miss_key])
+    return _GLYPHS[key]
 
 
 def cap_height(font) -> float:
@@ -130,6 +151,9 @@ def shape_text(text: str, font, tracking: float = 0.0, jitter: dict | None = Non
     for i, ch in enumerate(text):
         if cases is not None and i < len(cases):
             ch = ch.upper() if cases[i] else ch.lower()
+        if not has_glyph(font, ch):          # «△» и прочие знаки, которых нет в шрифте, пропускаем
+            sh.chars.append(" ")
+            continue
         if i == 0 and drop_font is not None and not ch.isspace():
             pen += _drop_cap(sh, ch, font, drop_font, pen, margin)
             sh.chars.append(ch)

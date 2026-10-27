@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 
 ORDINALS_M = {2: "ВТОРОЙ", 3: "ТРЕТИЙ", 4: "ЧЕТВЁРТЫЙ", 5: "ПЯТЫЙ", 6: "ШЕСТОЙ", 7: "СЕДЬМОЙ",
@@ -54,6 +55,11 @@ def parse_title(title: str, *, allow_trailing_number: bool = True) -> ParsedTitl
     """'Отель для нелюдей 2' -> ('Отель для нелюдей', season=2)."""
     t = " ".join((title or "").split())
     season = part = None
+    # «Охотник × Охотник (2011)», «Атака титанов [ТВ-2]» — скобки в конце не рисуем
+    m = re.search(r"\s*[\(\[]\s*(?:тв|tv)[\s-]*(\d{1,2})\s*[\)\]]\s*$", t, re.I)
+    if m:
+        season, t = int(m.group(1)), t[:m.start()].strip()
+    t = re.sub(r"\s*[\(\[][^)\]]*[\)\]]\s*$", "", t).strip() or t
 
     # часть: «Часть 2», «Part 2», «2-я часть», «Cour 2»
     t, m = _strip(t, r"[:.,]?\s*\(?(?:часть|part|cour)\s*(\d{1,2})\)?")
@@ -125,3 +131,66 @@ def slug(text: str) -> str:
     """Безопасное имя файла: 'Sakurasou no Pet na Kanojo' -> 'sakurasou-no-pet-na-kanojo'."""
     s = re.sub(r"[^\w\-]+", "-", (text or "").lower(), flags=re.UNICODE).strip("-")
     return s[:60] or "poster"
+
+
+_BRACKETS = re.compile(r"\s*[\(\[][^)\]]*[\)\]]")
+
+
+def norm_title(text: str) -> str:
+    """Для сравнения: без регистра, скобок «(2011)», пробелов и знаков; × = x."""
+    t = _BRACKETS.sub("", (text or "").lower().replace("×", "x"))
+    return re.sub(r"[\W_]+", "", t)
+
+
+def title_variants(info) -> list[str]:
+    """Все известные названия аниме: ромадзи, английское, японское, синонимы, русское."""
+    out = []
+    for v in [getattr(info, "name", None), getattr(info, "english", None), getattr(info, "japanese", None),
+              *(getattr(info, "synonyms", None) or []), getattr(info, "russian", None)]:
+        if v and norm_title(v) and v not in out:
+            out.append(v)
+    return out
+
+
+def title_match(text: str, variants: list[str]) -> tuple[float, str | None]:
+    """Насколько текст с постера похож на одно из названий (0..1) и на какое.
+    Учитывает и части: «HUNTER» — это кусок «Hunter x Hunter»."""
+    t = norm_title(text)
+    if len(t) < 3:
+        return 0.0, None
+    best, which = 0.0, None
+    for v in variants:
+        nv = norm_title(v)
+        if not nv:
+            continue
+        sm = SequenceMatcher(None, t, nv, autojunk=False)
+        # совпавшие куски: у латиницы — от 3 букв подряд (иначе «THE» совпадёт с чем угодно),
+        # у иероглифов и каны — от одного знака
+        min_block = 1 if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", t) else 3
+        matched = sum(b.size for b in sm.get_matching_blocks() if b.size >= min_block)
+        partial = matched / len(t) * min(1.0, len(t) / (0.35 * len(nv)))
+        score = max(sm.ratio(), partial)
+        if score > best:
+            best, which = score, v
+    return best, which
+
+
+def clean_title(text: str) -> str:
+    """Без хвостовых скобок: «Hunter x Hunter (2011)» → «Hunter x Hunter»."""
+    t = " ".join((text or "").split())
+    return re.sub(r"\s*[\(\[][^)\]]*[\)\]]\s*$", "", t).strip() or t
+
+
+CONNECTORS = ("×", "x", "X", "&", "+", "/", ":", "-", "–", "—", "・")
+
+
+def title_words(title: str) -> list[str]:
+    """Слова для переноса: соединительный знак держится за предыдущим словом
+    («ОХОТНИК ×» / «ОХОТНИК», а не «ОХОТНИК» / «× ОХОТНИК»)."""
+    out: list[str] = []
+    for w in (title or "").split():
+        if out and w in CONNECTORS:
+            out[-1] += " " + w
+        else:
+            out.append(w)
+    return out

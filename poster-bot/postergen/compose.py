@@ -16,7 +16,7 @@ from .detect import Cluster, Row
 from .elements import (distressed_title, dropcap_title, outlined_text, petal_text, plate_text,
                        sticker_text)
 from .logo import BoxStyle, LogoAnalysis
-from .titles import ORDINALS_M
+from .titles import ORDINALS_M, title_words
 from .typo import Element, font_for_cap, measure
 
 # короткие слова, которые нельзя оставлять в конце строки
@@ -34,9 +34,9 @@ class FontChoice:
 
 
 CUTE = FontChoice("comfortaa", 700, 0.035)
-BOLD = FontChoice("rubik", 800)
-CLEAN = FontChoice("montserrat", 800)
-SERIF = FontChoice("tinos", 400)           # тонкие логотипы с засечками («минтё»)
+BOLD = FontChoice("rubik", 900)
+CLEAN = FontChoice("montserrat", 900)
+SERIF = FontChoice("tinos", 700)           # логотипы с засечками («минтё») — жирным
 
 
 # ============================================================ замена логотипа
@@ -180,30 +180,32 @@ def _avail(g: RowGeom, W: int, H: int) -> float:
     return min(w, (H if g.angle == -90 else W) * 0.92)
 
 
-def _wrap2(words: list[str]) -> list[list[str]]:
-    return _balanced_lines(words, 2) if len(words) >= 2 else [words]
-
-
 def fit_row(g: RowGeom, segs: list[Seg], fc: FontChoice, W: int, H: int):
     """Во сколько раз уменьшить текст, чтобы влез, и нужен ли перенос на 2 строки."""
     avail = _avail(g, W, H)
     cap = g.cap
     s1 = avail / max(1.0, sum(_seg_width(s, s.text, fc, cap) for s in segs))
-    if len(segs) == 1 and segs[0].kind in ("sticker", "plain") and len(segs[0].text.split()) >= 2 \
-            and not segs[0].drop:
-        lines = _wrap2(segs[0].text.split())
-        lonely = any(len(ln) == 1 and ln[0].lower().strip(",.:") in SHORT_WORDS for ln in lines)
-        w2 = max(_seg_width(segs[0], " ".join(ln), fc, cap) for ln in lines)
-        s2 = min(avail / max(1.0, w2), 0.8)
-        # переносим, только если это заметно крупнее и не оставляет предлог одного в строке
-        if not lonely and s2 > s1 * 1.35:
-            return s2, lines
-    return s1, None
+    best, best_lines = s1, None
+    words = title_words(segs[0].text) if len(segs) == 1 else []
+    if len(segs) == 1 and segs[0].kind in ("sticker", "plain") and len(words) >= 2 and not segs[0].drop:
+        # 2 или 3 строки, если так буквы заметно крупнее (высокий логотип, длинное название);
+        # предлог один в строке не оставляем
+        for n, limit in ((2, 0.8), (3, 0.58)):
+            if len(words) < n:
+                break
+            lines = _balanced_lines(words, n)
+            if any(len(ln) == 1 and ln[0].lower().strip(",.:") in SHORT_WORDS for ln in lines):
+                continue
+            wn = max(_seg_width(segs[0], " ".join(ln), fc, cap) for ln in lines)
+            sn = min(avail / max(1.0, wn), limit)
+            if sn > best * 1.35:
+                best, best_lines = sn, lines
+    return best, best_lines
 
 
 def split_title_over_rows(title: str, geoms: list[RowGeom], styles: dict, fc: FontChoice,
                           W: int, H: int) -> list[list[str]]:
-    words = title.split()
+    words = title_words(title)
     free = [i for i, g in enumerate(geoms) if not g.tagline]
     n = len(free)
     groups: list[list[str]] = [[] for _ in geoms]
@@ -261,7 +263,7 @@ def _render_segment(seg: Seg, text: str, fc: FontChoice, cap: float, playful: bo
             cases.append(k % 2 == 0)
             k += 0 if c.isspace() else 1
         jitter = {"rot": 4.0, "dy": 0.035, "seed": seed}
-    elif seg.kind == "sticker":
+    elif seg.kind in ("sticker", "plain"):
         text = text.upper()
     char_colors = _accent_colors(text, st) if st.accent else None
     return sticker_text(text, fc.name, fc.weight, cap, st.glyph_colors, outline_px,
@@ -326,7 +328,7 @@ def _vstack(elements: list[Element], gap: float) -> Element:
 
 def _place_label(poster, text: str, near_box, cap: float):
     """Подпись «ВТОРОЙ СЕЗОН» над названием, если на постере её не было."""
-    el = outlined_text(text, "montserrat", 800, cap, fill=(255, 255, 255), outline=(30, 25, 40),
+    el = outlined_text(text, "montserrat", 900, cap, fill=(255, 255, 255), outline=(30, 25, 40),
                        outline_px=cap * 0.18, tracking=0.07, shadow_opacity=0.45)
     x0, y0, x1, y1 = near_box
     W, H = poster.size
@@ -341,7 +343,8 @@ def _place_label(poster, text: str, near_box, cap: float):
 def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, title: str,
                        font: str | None = None, playful: bool = True, seed: int = 0,
                        bottom_reserve: float = 0.0, label: str | None = None,
-                       subtitle: str | None = None, sub_size: float | None = None, avoid=None):
+                       subtitle: str | None = None, sub_size: float | None = None, avoid=None,
+                       upper: bool = False):
     """Рисует русское название на месте японского. Возвращает занятую область.
 
     subtitle — английская строка из логотипа (её стёрли вместе с японской и набираем заново
@@ -349,14 +352,19 @@ def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, 
     """
     W, H = poster.size
     styles = la.styles
+    if upper:
+        title = title.upper()       # оригинальный логотип набран заглавными
     fc = choose_font(list(styles.values()), font)
     if fc.name == SERIF.name and len(cluster.rows) == 1 and all(st.kind == "plain" for st in styles.values()):
-        return render_serif_logo(poster, cluster, la, title, fc, subtitle, avoid, bottom_reserve), fc
+        area = render_serif_logo(poster, cluster, la, title, fc, subtitle, avoid, bottom_reserve)
+        if area is not None:
+            return area, fc
+        # длинное название в одну строку стало бы слишком мелким — обычная раскладка с переносом
     geoms = row_geoms(cluster.rows, label)
     groups = split_title_over_rows(title, geoms, styles, fc, W, H)
     cx0, cy0, cx1, cy1 = cluster.bbox
     multi = len(geoms) > 1
-    placed = []
+    plans = []          # [geom, builder, cap, element]
     label_used = False
     for g, words in zip(geoms, groups):
         row = g.row
@@ -373,23 +381,43 @@ def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, 
             continue
         scale, lines = fit_row(g, segs, fc, W, H)
         cap = g.cap * min(1.0, scale)
-        fun = playful and g.main
 
-        def build(cap_, lines_):
-            if lines_:
+        def build(cap_, segs=segs, lines=lines, fun=playful and g.main):
+            if lines:
                 seg = segs[0]
                 els = [_render_segment(Seg(seg.kind, seg.style, " ".join(ln)), " ".join(ln), fc, cap_, fun, seed + i)
-                       for i, ln in enumerate(lines_)]
+                       for i, ln in enumerate(lines)]
                 return _vstack(els, gap=cap_ * 0.3)
             els = [_render_segment(s, s.text, fc, cap_, fun, seed) for s in segs]
             return _hstack(els, gap=cap_ * 0.25, overlap_last=0.25 if segs[-1].kind == "badge" else 0)
 
-        el = build(cap, lines)
+        el = build(cap)
         bb = el.image.getbbox()
-        width = bb[2] - bb[0]
         avail = _avail(g, W, H)
-        if width > avail * 1.02:
-            el = build(cap * avail / width, lines)
+        if bb[2] - bb[0] > avail * 1.02:
+            cap *= avail / (bb[2] - bb[0])
+            el = build(cap)
+        plans.append([g, build, cap, el])
+
+    # строки, которые в оригинале одного размера (HUNTER / HUNTER), и по-русски одного размера
+    text_plans = [p for p in plans if not p[0].tagline]
+    for p in text_plans:
+        peers = [q for q in text_plans if 0.8 <= q[0].thick / max(1e-6, p[0].thick) <= 1.25]
+        target = min(q[2] for q in peers)
+        if p[2] > target * 1.03:
+            p[2], p[3] = target, p[1](target)
+
+    # если буквы стали мельче оригинальных, строки сдвигаем друг к другу (иначе между ними дыра)
+    centers = {id(p[0]): p[0].cy for p in plans}
+    if len(plans) > 1:
+        shrink = float(np.clip(np.mean([p[2] / max(1e-6, p[0].cap) for p in plans]), 0.55, 1.0))
+        if shrink < 0.92:
+            mid = float(np.mean([p[0].cy for p in plans]))
+            centers = {id(p[0]): mid + (p[0].cy - mid) * shrink for p in plans}
+
+    placed = []
+    for g, _, cap, el in plans:
+        row = g.row
         el = el.rotated(g.angle)
         # выравнивание как в оригинале
         bb = el.image.getbbox()
@@ -402,7 +430,7 @@ def render_replacement(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, 
             x = row.x1 + el.cx - bb[2]          # правый край как у оригинала
         else:
             x = g.cx
-        placed.append([g, el, x, g.cy])
+        placed.append([g, el, x, centers[id(g)]])
 
     m = 0.02 * W
 
@@ -541,6 +569,8 @@ def render_serif_logo(poster: Image.Image, cluster: Cluster, la: LogoAnalysis, t
         if w <= target_w * 1.01:
             break
         cap *= target_w / w
+    if cap < 0.5 * cap_max and len(title_words(title)) >= 2:
+        return None
     # по центру старого логотипа, верх — на месте его верха
     cx = (x0 + x1) / 2
     px = cx - (bb[0] + bb[2]) / 2
@@ -605,8 +635,8 @@ def render_overlay(poster: Image.Image, title: str, label: str | None, subtitle:
                    distress: float = 1.0, bottom_reserve: float = 0.0):
     """Стиль «ОТЕЛЬ ◆ ДЛЯ ◆ НЕЛЮДЕЙ»: подпись сезона, потёртый заголовок, английское название."""
     W, H = poster.size
-    fc = FontChoice("unbounded", 800)
-    words = title.upper().split()
+    fc = FontChoice("unbounded", 900)
+    words = title_words(title.upper())
     max_cap = 0.052 * H
     max_w = 0.88 * W
     # как на образце: в одну строку, пока буквы не становятся слишком мелкими
@@ -627,7 +657,7 @@ def render_overlay(poster: Image.Image, title: str, label: str | None, subtitle:
     parts = [title_el]
     label_el = sub_el = None
     if label:
-        label_el = outlined_text(label, "montserrat", 800, cap * 0.42, tracking=0.07,
+        label_el = outlined_text(label, "montserrat", 900, cap * 0.42, tracking=0.07,
                                  shadow_opacity=0.5, halo_opacity=0.55)
         parts.insert(0, label_el)
     if subtitle:
@@ -636,7 +666,7 @@ def render_overlay(poster: Image.Image, title: str, label: str | None, subtitle:
         sw = measure(subtitle.upper(), f, 0.07)
         if sw > max_w:
             sub_cap *= max_w / sw
-        sub_el = outlined_text(subtitle.upper(), "unbounded", 700, max(sub_cap, 0.014 * H), tracking=0.07,
+        sub_el = outlined_text(subtitle.upper(), "unbounded", 900, max(sub_cap, 0.014 * H), tracking=0.07,
                                shadow_opacity=0.5, halo_opacity=0.55, distress=0.45 * distress, seed=seed + 1)
         parts.append(sub_el)
     gap = cap * 0.42

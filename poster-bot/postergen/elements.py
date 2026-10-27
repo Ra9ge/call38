@@ -4,6 +4,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from .titles import CONNECTORS
 from .typo import (SS, Element, Layer, Shaped, blur, dilate, finish, font_for_cap, grunge,
                    measure, per_glyph_fill, rounded_rect_alpha, shape_text, shift, spread_colors)
 
@@ -171,25 +172,24 @@ def word_line_alpha(words: list[str], font: str, weight: int, cap: float, tracki
     cap_mid = (word_rows.min() + word_rows.max()) / 2 if len(word_rows) else mid
     gap = int(c * gap_em)
     d = c * 0.24
-    sep_w = int(2 * d) if separator == "diamond" else 0
-    total = sum(p.shape[1] for p in parts) + (len(parts) - 1) * (2 * gap + sep_w)
-    if separator != "diamond":
-        total = sum(p.shape[1] for p in parts) + (len(parts) - 1) * int(c * 0.55)
+    # между словами — ромб; после «×», «&» и т.п. — просто пробел (знак уже стоит)
+    kinds = ["space" if separator != "diamond" or words[i].endswith(CONNECTORS) else "diamond"
+             for i in range(len(parts) - 1)]
+    widths = [2 * gap + int(2 * d) if k == "diamond" else int(c * 0.55) for k in kinds]
+    total = sum(p.shape[1] for p in parts) + sum(widths)
     out = np.zeros((H, total), np.float32)
     x = 0
     for i, p in enumerate(parts):
         out[:, x:x + p.shape[1]] = np.maximum(out[:, x:x + p.shape[1]], p)
         x += p.shape[1]
         if i < len(parts) - 1:
-            if separator == "diamond":
+            if kinds[i] == "diamond":
                 cx = x + gap + d
                 poly = np.array([[cx, cap_mid - d], [cx + d, cap_mid], [cx, cap_mid + d], [cx - d, cap_mid]])
                 m = np.zeros((H, total), np.uint8)
                 cv2.fillPoly(m, [np.round(poly).astype(np.int32)], 255, cv2.LINE_AA)
                 out = np.maximum(out, m.astype(np.float32) / 255)
-                x += 2 * gap + sep_w
-            else:
-                x += int(c * 0.55)
+            x += widths[i]
     return out
 
 

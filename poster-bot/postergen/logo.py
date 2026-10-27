@@ -323,14 +323,8 @@ class Analyzer:
                 accent = rgb
                 break
         # толщина штрихов относительно высоты строки
-        thin = False
         fm = fill_c[4] & Q
-        if (fm > 0).sum() > 50:
-            d = cv2.distanceTransform((fm > 0).astype(np.uint8), cv2.DIST_L2, 3)
-            ridge = (d >= cv2.dilate(d, np.ones((3, 3), np.uint8))) & (d > 0.9)
-            if ridge.any():
-                thin = 2 * float(d[ridge].mean()) / h < 0.05
-        outline = outline_c[3] if outline_c else None
+        thin = (fm > 0).sum() > 50 and stroke_ratio(fm, h) < 0.05
         # стираем только сами буквы (с запасом на сглаживание и тень), а не всю рамку —
         # так не задеваем фон и соседние надписи вроде английского названия
         # Что стирать: сами буквы. Строгий цвет — чтобы не прилипал похожий фон (подсвеченная
@@ -352,6 +346,21 @@ class Analyzer:
             if len(ids):
                 strokes |= np.isin(lab, ids).astype(np.uint8) * 255
             strokes |= (loose & (_grow(strokes, max(2, h * 0.05)) > 0)).astype(np.uint8) * 255
+
+        # Цвет и толщину берём по «телу» букв (буквы вместе с обводкой, тенью, градиентом):
+        # заливка — из середины штрихов, обводка — с их края. Так белые буквы с тёмной обводкой,
+        # градиент или 3D-тень не путаются с цветом букв.
+        found = self._letter_body(box, Q, Qd, mid, edge)
+        if found is not None:
+            body, outline_part = found
+            got = self._body_colors(body, h, outline_part)
+            if got is not None:
+                fill, outline_rgb, thin = got
+                outline_c = (None, None, None, outline_rgb) if outline_rgb else None
+                if accent is not None and np.linalg.norm(self.lab_of(accent) - self.lab_of(fill)) < 40:
+                    accent = None
+            strokes |= body
+        outline = outline_c[3] if outline_c else None
         if (strokes > 0).sum() > 0.02 * (Q > 0).sum():
             mask = _grow(strokes, max(3, h * 0.08))
         else:
@@ -359,6 +368,54 @@ class Analyzer:
             mask = _grow(Q, h * 0.14)
         return BoxStyle("plain", [fill], outline, 0.06 if outline else 0.0, mask=mask, accent=accent, thin=thin,
                         strokes=strokes)
+
+    def _letter_body(self, box: TextBox, Q, Qd, mid, edge) -> np.ndarray | None:
+        """Буквы вместе с обводкой: всё в рамке, что не похоже на фон вокруг надписи."""
+        h = box.size
+        ring = (_grow(Q, h * 0.35) & ~_grow(Q, max(3, h * 0.1))) > 0
+        bg = self._clusters(ring, k=6, merge_de=10, min_share=0.03)
+        if not bg:
+            return None
+        ys, xs = np.nonzero(Qd)
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        lab = self.lab[y0:y1, x0:x1]
+        dmin = np.full(lab.shape[:2], 1e9, np.float32)
+        for rgb, *_ in bg:
+            dmin = np.minimum(dmin, np.linalg.norm(lab - self.lab_of(rgb), axis=2))
+        far = np.zeros(Q.shape, bool)
+        far[y0:y1, x0:x1] = dmin > 28
+        body = self._strokes(far, Qd, mid, edge)
+        if (body > 0).sum() <= 0.04 * (Q > 0).sum():
+            return None
+        # Буквы-контуры (белая середина того же цвета, что фон, и тёмная обводка): нашлась только
+        # обводка, а середина — «дыры» в ней. Если дыры больше самих штрихов — это середина букв.
+        filled = _fill_holes(body, max_area=0.6 * h * h)
+        if (filled > 0).sum() >= 1.8 * (body > 0).sum():
+            return filled, body          # (буквы целиком, их обводка)
+        return body, None
+
+    def _body_colors(self, body: np.ndarray, h: float, outline_part: np.ndarray | None = None):
+        """(цвет букв, цвет обводки или None, тонкие ли штрихи) по телу букв."""
+        to_rgb = lambda lab: tuple(int(v) for v in cv2.cvtColor(
+            np.clip(lab, 0, 255).astype(np.uint8).reshape(1, 1, 3), cv2.COLOR_LAB2RGB)[0, 0])
+        inside = body > 0
+        if inside.sum() < 40:
+            return None
+        if outline_part is not None:
+            # буквы-контуры: середина — самый частый цвет внутри обводки, обводка — сама обводка
+            holes = inside & (outline_part == 0)
+            cl = self._clusters(holes, k=4, merge_de=15, min_share=0.05)
+            if not cl:
+                return None
+            outline = to_rgb(np.median(self.lab[outline_part > 0], axis=0))
+            return cl[0][0], outline, False
+        d = cv2.distanceTransform(inside.astype(np.uint8), cv2.DIST_L2, 3)
+        deep = inside & (d >= max(1.0, float(np.percentile(d[inside], 65))))
+        fill_lab = np.median(self.lab[deep], axis=0)
+        rim = inside & (d <= 2.0)
+        rim_lab = np.median(self.lab[rim], axis=0) if rim.any() else fill_lab
+        outline = to_rgb(rim_lab) if np.linalg.norm((rim_lab - fill_lab) * [0.6, 1, 1]) > 30 else None
+        return to_rgb(fill_lab), outline, stroke_ratio(body, h) < 0.05
 
     def _thin_strokes(self, fill, Q, core, edge, h) -> np.ndarray:
         """Тонкие линии светлее (или темнее) своего окружения — штрихи букв. Морфологический
@@ -420,6 +477,14 @@ def _band(q, a: float, b: float, vertical: bool) -> np.ndarray:
     if vertical:
         return np.array([tl + a * (tr - tl), tl + b * (tr - tl), bl + b * (br - bl), bl + a * (br - bl)])
     return np.array([tl + a * (bl - tl), tr + a * (br - tr), tr + b * (br - tr), tl + b * (bl - tl)])
+
+
+def stroke_ratio(mask: np.ndarray, h: float) -> float:
+    """Средняя толщина штрихов (≈ 2·площадь/периметр) относительно высоты строки."""
+    m = (mask > 0).astype(np.uint8)
+    area = int(m.sum())
+    perim = int((m & (1 - cv2.erode(m, np.ones((3, 3), np.uint8)))).sum())
+    return 2.0 * area / max(1, perim) / max(1.0, h)
 
 
 def _fill_holes(m: np.ndarray, max_area: float | None = None) -> np.ndarray:
